@@ -544,11 +544,18 @@ for _i in range(1, MAX_CHARTS + 1):
     Output("file-name-display", "children"),
     Input("file-upload", "contents"),
     State("file-upload", "filename"),
+    State("temp-file-path", "data"),
     prevent_initial_call=True,
 )
-def on_file_upload(contents, filename):
+def on_file_upload(contents, filename, old_temp_path):
     if contents is None:
         return no_update, no_update, no_update, no_update
+    # Clean up previous temp file when a new file is uploaded (Issue #3)
+    if old_temp_path:
+        try:
+            os.remove(old_temp_path)
+        except OSError:
+            pass
     content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
     # Use NamedTemporaryFile pattern for safer temp file handling (Issue #3)
@@ -606,12 +613,6 @@ def on_sheet_selected(sheet_name, temp_path):
         results = [no_update, f"Error loading sheet: {e}"]
         results.extend([no_update] * (len(_load_outputs) - 2))
         return results
-    finally:
-        # Issue #3: Delete temp file immediately after data is loaded into memory
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
 
     if len(df) == 0 or "Time" not in df.columns:
         results = [no_update, "No timestamp data found in this sheet."]
@@ -802,6 +803,8 @@ for _ci in range(1, MAX_CHARTS + 1):
             return _build_figure(None, [], {}), no_update, no_update, no_update
 
         df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
+        if "Time" in df.columns:
+            df["Time"] = pd.to_datetime(df["Time"])
         tag_map = session_data["tag_map"]
         data_start = pd.Timestamp(session_data["data_start"])
         data_end = pd.Timestamp(session_data["data_end"])
