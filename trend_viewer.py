@@ -920,7 +920,7 @@ def update_setup_dropdown(saved):
 
 _load_setup_outputs = [
     Output("visible-charts", "data", allow_duplicate=True),
-    Output("setup-status-msg", "children"),
+    Output("setup-status-msg", "children", allow_duplicate=True),
 ]
 for _c in range(1, MAX_CHARTS + 1):
     for _s in range(1, NUM_SERIES + 1):
