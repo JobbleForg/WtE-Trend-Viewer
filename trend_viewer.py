@@ -417,33 +417,41 @@ app.index_string = '''<!DOCTYPE html>
 
 @app.callback(
     Output("visible-charts", "data"),
+    Output("sync-state", "data", allow_duplicate=True),
     Input("add-chart-btn", "n_clicks"),
     Input({"type": "close-btn", "index": ALL}, "n_clicks"),
     State("visible-charts", "data"),
+    State("sync-state", "data"),
     prevent_initial_call=True,
 )
-def update_visible_charts(add_clicks, close_clicks_list, visible):
+def update_visible_charts(add_clicks, close_clicks_list, visible, sync_state):
     ctx = callback_context
     if not ctx.triggered:
-        return no_update
+        return no_update, no_update
     triggered = ctx.triggered[0]["prop_id"]
 
+    new_visible = no_update
     if triggered == "add-chart-btn.n_clicks":
-        # Find the first hidden chart
         for i in range(1, MAX_CHARTS + 1):
             if i not in visible:
-                return visible + [i]
-        return no_update  # All charts already visible
+                new_visible = visible + [i]
+                break
     else:
-        # A close button was clicked — parse which one
         try:
             prop = json.loads(triggered.rsplit(".", 1)[0])
             chart_id = prop["index"]
             if chart_id in visible and len(visible) > 1:
-                return [v for v in visible if v != chart_id]
+                new_visible = [v for v in visible if v != chart_id]
         except Exception:
             pass
-    return no_update
+
+    # Reset sync if the master chart was closed
+    new_sync = no_update
+    if new_visible is not no_update and sync_state and sync_state.get("active"):
+        if sync_state.get("master") not in new_visible:
+            new_sync = {"active": False, "master": None}
+
+    return new_visible, new_sync
 
 
 # ---------------------------------------------------------------------------
@@ -798,8 +806,10 @@ def toggle_sync(*args):
         return no_update
 
     if sync_state and sync_state.get("active"):
-        # If already synced, clicking any sync button deactivates sync
-        return {"active": False, "master": None}
+        # Only the master can deactivate sync; locked charts do nothing
+        if sync_state.get("master") == chart_id:
+            return {"active": False, "master": None}
+        return no_update
     else:
         # Activate sync with this chart as master
         return {"active": True, "master": chart_id}
@@ -828,16 +838,16 @@ for _si in range(1, MAX_CHARTS + 1):
         _sync_outputs,
         Input("sync-state", "data"),
         Input({"type": "start-time", "index": _si}, "data"),
+        Input("visible-charts", "data"),
         State({"type": "goto-date", "index": _si}, "value"),
         State({"type": "goto-time", "index": _si}, "value"),
         State({"type": "win-min", "index": _si}, "value"),
         State({"type": "win-hr", "index": _si}, "value"),
         State({"type": "step", "index": _si}, "value"),
-        State("visible-charts", "data"),
         prevent_initial_call=True,
     )
-    def propagate_sync(sync_state, start_iso, goto_date, goto_time,
-                       win_min, win_hr, step, visible, _master=_si,
+    def propagate_sync(sync_state, start_iso, visible, goto_date, goto_time,
+                       win_min, win_hr, step, _master=_si,
                        _targets=list(_sync_output_charts)):
         n_targets = len(_targets)
         n_outputs = n_targets * 6
