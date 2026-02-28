@@ -7,31 +7,41 @@ Charts can be added, removed, and resized.
 """
 
 import os
+import atexit
 import base64
+import glob
 import json
 import tempfile
+from io import StringIO
 import pandas as pd
 from datetime import timedelta
 from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, ALL, MATCH
 import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
-# Global mutable state
+# Constants
 # ---------------------------------------------------------------------------
 
 NUM_SERIES = 6
 MAX_CHARTS = 8
 INITIAL_VISIBLE = 4
 
-APP_STATE = {
-    "df": pd.DataFrame(),
-    "tag_map": {},
-    "chart_packages": [],
-    "all_tags": [],
-    "name_to_code": {},
-    "data_start": None,
-    "data_end": None,
-}
+
+# ---------------------------------------------------------------------------
+# Temp-file cleanup (Issue #3)
+# ---------------------------------------------------------------------------
+
+def _cleanup_temp_files():
+    """Remove any leftover wte_upload_* temp files on shutdown."""
+    pattern = os.path.join(tempfile.gettempdir(), "wte_upload_*")
+    for path in glob.glob(pattern):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_temp_files)
 
 
 def _num_or_none(val):
@@ -296,6 +306,7 @@ app.layout = html.Div(style={
     "fontFamily": "'Segoe UI', Consolas, monospace",
 }, children=[
     dcc.Store(id="temp-file-path", data=None),
+    dcc.Store(id="session-data", storage_type="memory", data=None),
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
@@ -540,14 +551,23 @@ def on_file_upload(contents, filename):
         return no_update, no_update, no_update, no_update
     content_type, content_string = contents.split(",")
     decoded = base64.b64decode(content_string)
-    temp_path = os.path.join(tempfile.gettempdir(), f"wte_upload_{filename}")
-    with open(temp_path, "wb") as f:
-        f.write(decoded)
+    # Use NamedTemporaryFile pattern for safer temp file handling (Issue #3)
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="wte_upload_", suffix=f"_{filename}", delete=False
+    )
+    temp_path = tmp.name
     try:
+        tmp.write(decoded)
+        tmp.close()
         xl = pd.ExcelFile(temp_path, engine="openpyxl")
         sheets = xl.sheet_names
         xl.close()
     except Exception as e:
+        # Clean up on error
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
         return [], None, None, f"Error: {e}"
     options = [{"label": s, "value": s} for s in sheets]
     return options, None, temp_path, filename
@@ -558,6 +578,7 @@ def on_file_upload(contents, filename):
 # ---------------------------------------------------------------------------
 
 _load_outputs = [
+    Output("session-data", "data"),
     Output("data-stats", "children"),
     Output("pkg-select", "options"),
 ]
@@ -580,17 +601,23 @@ def on_sheet_selected(sheet_name, temp_path):
         return [no_update] * len(_load_outputs)
     try:
         df = load_sheet_data(temp_path, sheet_name)
+        tag_map, chart_packages = try_load_tag_refs(temp_path)
     except Exception as e:
-        results = [f"Error loading sheet: {e}"]
-        results.extend([no_update] * (len(_load_outputs) - 1))
+        results = [no_update, f"Error loading sheet: {e}"]
+        results.extend([no_update] * (len(_load_outputs) - 2))
         return results
+    finally:
+        # Issue #3: Delete temp file immediately after data is loaded into memory
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
     if len(df) == 0 or "Time" not in df.columns:
-        results = ["No timestamp data found in this sheet."]
-        results.extend([no_update] * (len(_load_outputs) - 1))
+        results = [no_update, "No timestamp data found in this sheet."]
+        results.extend([no_update] * (len(_load_outputs) - 2))
         return results
 
-    tag_map, chart_packages = try_load_tag_refs(temp_path)
     all_tags = [c for c in df.columns if c != "Time"]
     data_start = df["Time"].iloc[0]
     data_end = df["Time"].iloc[-1]
@@ -599,11 +626,16 @@ def on_sheet_selected(sheet_name, temp_path):
     for code, info in tag_map.items():
         name_to_code[info["name"]] = code
 
-    APP_STATE.update({
-        "df": df, "tag_map": tag_map, "chart_packages": chart_packages,
-        "all_tags": all_tags, "name_to_code": name_to_code,
-        "data_start": data_start, "data_end": data_end,
-    })
+    # Issue #4: Store session data as JSON in dcc.Store instead of global state
+    session_data = {
+        "df_json": df.to_json(date_format="iso", orient="split"),
+        "tag_map": tag_map,
+        "chart_packages": chart_packages,
+        "all_tags": all_tags,
+        "name_to_code": name_to_code,
+        "data_start": data_start.isoformat(),
+        "data_end": data_end.isoformat(),
+    }
 
     stats = (
         f"Start: {data_start.strftime('%Y-%m-%d %H:%M')}  |  "
@@ -621,7 +653,7 @@ def on_sheet_selected(sheet_name, temp_path):
             "value": pkg["num"],
         })
 
-    results = [stats, pkg_options]
+    results = [session_data, stats, pkg_options]
     start_iso = data_start.isoformat()
     date_str = data_start.strftime("%Y-%m-%d")
     for _c in range(1, MAX_CHARTS + 1):
@@ -758,16 +790,21 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "scroll-left", "index": _ci}, "n_clicks"),
         Input({"type": "scroll-right", "index": _ci}, "n_clicks"),
         State({"type": "start-time", "index": _ci}, "data"),
+        State("session-data", "data"),
         prevent_initial_call=True,
     )
     def update_chart(*args, _cid=_ci):
         tags = list(args[:NUM_SERIES])
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, start_time_iso = args[NUM_SERIES:]
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, start_time_iso, session_data = args[NUM_SERIES:]
 
-        df = APP_STATE["df"]
-        tag_map = APP_STATE["tag_map"]
-        data_start = APP_STATE["data_start"]
-        data_end = APP_STATE["data_end"]
+        # Issue #4: Read from per-session store instead of global state
+        if not session_data:
+            return _build_figure(None, [], {}), no_update, no_update, no_update
+
+        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
+        tag_map = session_data["tag_map"]
+        data_start = pd.Timestamp(session_data["data_start"])
+        data_end = pd.Timestamp(session_data["data_end"])
 
         if df.empty or data_start is None:
             return _build_figure(None, [], {}), no_update, no_update, no_update
@@ -1018,14 +1055,18 @@ _pkg_outputs = [
 @app.callback(
     _pkg_outputs,
     Input("pkg-select", "value"),
+    State("session-data", "data"),
     prevent_initial_call=True,
 )
-def load_chart_package(pkg_num):
+def load_chart_package(pkg_num, session_data):
     if not pkg_num:
         return [no_update] * NUM_SERIES
-    name_to_code = APP_STATE["name_to_code"]
-    all_tags = APP_STATE["all_tags"]
-    for pkg in APP_STATE["chart_packages"]:
+    # Issue #4: Read from per-session store instead of global state
+    if not session_data:
+        return [no_update] * NUM_SERIES
+    name_to_code = session_data["name_to_code"]
+    all_tags = session_data["all_tags"]
+    for pkg in session_data["chart_packages"]:
         if pkg["num"] == pkg_num:
             codes = []
             for n in pkg["tags"]:
