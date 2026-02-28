@@ -240,6 +240,10 @@ def make_chart_panel(chart_id):
                     style={**DROPDOWN_STYLE, "width": "90px", "fontSize": "11px"},
                     className="dark-dropdown",
                 ),
+                html.Button("\U0001F517 Sync", id={"type": "sync-btn", "index": chart_id},
+                            style={**BTN_STYLE, "color": "#58a6ff",
+                                   "fontSize": "11px", "padding": "2px 10px"},
+                            title="Sync all charts to this chart's time"),
                 html.Button("\u2715", id={"type": "close-btn", "index": chart_id},
                             style={**BTN_STYLE, "color": "#f85149",
                                    "fontSize": "14px", "padding": "2px 8px"},
@@ -293,6 +297,7 @@ app.layout = html.Div(style={
 }, children=[
     dcc.Store(id="temp-file-path", data=None),
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
+    dcc.Store(id="sync-state", data={"active": False, "master": None}),
 
     # Header toolbar
     html.Div(style={
@@ -389,6 +394,11 @@ app.index_string = '''<!DOCTYPE html>
             background-color: ''' + PANEL_BG + ''' !important;
         }
         body { margin: 0; background-color: ''' + BG_COLOR + '''; }
+        /* Disabled time controls styling for sync lock */
+        input:disabled, button:disabled {
+            opacity: 0.4 !important;
+            cursor: not-allowed !important;
+        }
     </style>
 </head>
 <body>
@@ -700,7 +710,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         Output({"type": "graph", "index": _ci}, "figure"),
         Output({"type": "start-time", "index": _ci}, "data", allow_duplicate=True),
         Output({"type": "goto-date", "index": _ci}, "value", allow_duplicate=True),
-        Output({"type": "goto-time", "index": _ci}, "value"),
+        Output({"type": "goto-time", "index": _ci}, "value", allow_duplicate=True),
         *_series_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
@@ -761,6 +771,199 @@ for _ci in range(1, MAX_CHARTS + 1):
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
+
+
+# ---------------------------------------------------------------------------
+# Sync callbacks
+# ---------------------------------------------------------------------------
+
+# --- Toggle sync state when any sync button is clicked ---
+@app.callback(
+    Output("sync-state", "data"),
+    [Input({"type": "sync-btn", "index": i}, "n_clicks") for i in range(1, MAX_CHARTS + 1)],
+    State("sync-state", "data"),
+    prevent_initial_call=True,
+)
+def toggle_sync(*args):
+    clicks = args[:MAX_CHARTS]
+    sync_state = args[MAX_CHARTS]
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    triggered = ctx.triggered[0]["prop_id"]
+    try:
+        prop = json.loads(triggered.rsplit(".", 1)[0])
+        chart_id = prop["index"]
+    except Exception:
+        return no_update
+
+    if sync_state and sync_state.get("active"):
+        # If already synced, clicking any sync button deactivates sync
+        return {"active": False, "master": None}
+    else:
+        # Activate sync with this chart as master
+        return {"active": True, "master": chart_id}
+
+
+# --- Propagate master time settings to all other charts when sync activates
+#     or when master's time controls change ---
+for _si in range(1, MAX_CHARTS + 1):
+    # Build outputs for all OTHER charts (non-master candidates)
+    _sync_outputs = []
+    _sync_output_charts = []
+    for _oi in range(1, MAX_CHARTS + 1):
+        if _oi == _si:
+            continue
+        _sync_outputs.extend([
+            Output({"type": "start-time", "index": _oi}, "data", allow_duplicate=True),
+            Output({"type": "goto-date", "index": _oi}, "value", allow_duplicate=True),
+            Output({"type": "goto-time", "index": _oi}, "value", allow_duplicate=True),
+            Output({"type": "win-min", "index": _oi}, "value", allow_duplicate=True),
+            Output({"type": "win-hr", "index": _oi}, "value", allow_duplicate=True),
+            Output({"type": "step", "index": _oi}, "value", allow_duplicate=True),
+        ])
+        _sync_output_charts.append(_oi)
+
+    @app.callback(
+        _sync_outputs,
+        Input("sync-state", "data"),
+        Input({"type": "start-time", "index": _si}, "data"),
+        State({"type": "goto-date", "index": _si}, "value"),
+        State({"type": "goto-time", "index": _si}, "value"),
+        State({"type": "win-min", "index": _si}, "value"),
+        State({"type": "win-hr", "index": _si}, "value"),
+        State({"type": "step", "index": _si}, "value"),
+        State("visible-charts", "data"),
+        prevent_initial_call=True,
+    )
+    def propagate_sync(sync_state, start_iso, goto_date, goto_time,
+                       win_min, win_hr, step, visible, _master=_si,
+                       _targets=list(_sync_output_charts)):
+        n_targets = len(_targets)
+        n_outputs = n_targets * 6
+        if not sync_state or not sync_state.get("active"):
+            return [no_update] * n_outputs
+        if sync_state.get("master") != _master:
+            return [no_update] * n_outputs
+        # Propagate master settings to all other visible charts
+        results = []
+        for t in _targets:
+            if t in (visible or []):
+                results.extend([
+                    start_iso,
+                    goto_date,
+                    goto_time,
+                    win_min,
+                    win_hr,
+                    step,
+                ])
+            else:
+                results.extend([no_update] * 6)
+        return results
+
+    propagate_sync.__name__ = f"propagate_sync_{_si}"
+
+
+# --- Visual indicator: update panel style based on sync state ---
+# Overrides the existing panel style callback with sync awareness
+for _vi in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "chart-wrapper", "index": _vi}, "style", allow_duplicate=True),
+        Input("sync-state", "data"),
+        State("visible-charts", "data"),
+        State({"type": "width-select", "index": _vi}, "value"),
+        prevent_initial_call=True,
+    )
+    def update_sync_border(sync_state, visible, width_val, _cid=_vi):
+        is_visible = _cid in (visible or [])
+        if width_val == "full":
+            basis = "calc(100% - 0px)"
+        elif width_val == "quarter":
+            basis = "calc(25% - 8px)"
+        else:
+            basis = "calc(50% - 5px)"
+        is_master = (sync_state and sync_state.get("active")
+                     and sync_state.get("master") == _cid)
+        is_locked = (sync_state and sync_state.get("active")
+                     and sync_state.get("master") != _cid)
+        if is_master:
+            border = "2px solid #00e5ff"
+        elif is_locked:
+            border = f"1px solid {BORDER_COLOR}"
+        else:
+            border = f"1px solid {BORDER_COLOR}"
+        return {
+            "backgroundColor": PANEL_BG, "borderRadius": "8px",
+            "border": border, "padding": "8px",
+            "display": "flex" if is_visible else "none",
+            "flexDirection": "column",
+            "flexBasis": basis, "flexGrow": "0", "flexShrink": "0",
+            "minWidth": "280px",
+            "boxSizing": "border-box",
+        }
+
+    update_sync_border.__name__ = f"update_sync_border_{_vi}"
+
+
+# --- Update sync button label based on sync state ---
+for _bi in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "sync-btn", "index": _bi}, "children"),
+        Output({"type": "sync-btn", "index": _bi}, "style"),
+        Input("sync-state", "data"),
+        prevent_initial_call=True,
+    )
+    def update_sync_btn(sync_state, _cid=_bi):
+        if sync_state and sync_state.get("active"):
+            if sync_state.get("master") == _cid:
+                # Master: show Unsync button with highlight
+                return ("\U0001F517 Unsync", {
+                    **BTN_STYLE, "color": "#0d1117",
+                    "backgroundColor": "#00e5ff",
+                    "fontSize": "11px", "padding": "2px 10px",
+                    "fontWeight": "bold",
+                })
+            else:
+                # Locked: dimmed sync button
+                return ("\U0001F512 Locked", {
+                    **BTN_STYLE, "color": MUTED_TEXT,
+                    "fontSize": "11px", "padding": "2px 10px",
+                    "cursor": "default", "opacity": "0.6",
+                })
+        # Not synced: normal sync button
+        return ("\U0001F517 Sync", {
+            **BTN_STYLE, "color": "#58a6ff",
+            "fontSize": "11px", "padding": "2px 10px",
+        })
+
+    update_sync_btn.__name__ = f"update_sync_btn_{_bi}"
+
+
+# --- Disable / enable time controls based on sync state ---
+for _di in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "goto-date", "index": _di}, "disabled"),
+        Output({"type": "goto-time", "index": _di}, "disabled"),
+        Output({"type": "win-min", "index": _di}, "disabled"),
+        Output({"type": "win-hr", "index": _di}, "disabled"),
+        Output({"type": "step", "index": _di}, "disabled"),
+        Output({"type": "scroll-left", "index": _di}, "disabled"),
+        Output({"type": "scroll-right", "index": _di}, "disabled"),
+        Input("sync-state", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_controls(sync_state, _cid=_di):
+        if sync_state and sync_state.get("active"):
+            if sync_state.get("master") == _cid:
+                # Master: controls remain enabled
+                return False, False, False, False, False, False, False
+            else:
+                # Locked: disable all time controls
+                return True, True, True, True, True, True, True
+        # Not synced: all enabled
+        return False, False, False, False, False, False, False
+
+    toggle_controls.__name__ = f"toggle_controls_{_di}"
 
 
 # ---------------------------------------------------------------------------
