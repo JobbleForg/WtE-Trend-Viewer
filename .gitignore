@@ -1,0 +1,12 @@
+# Excel data files
+*.xlsx
+*.xlsm
+*.xls
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code local settings
+.claude/
