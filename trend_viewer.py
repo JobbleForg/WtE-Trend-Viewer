@@ -310,6 +310,7 @@ app.layout = html.Div(style={
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
+    dcc.Store(id="tag-nicknames", storage_type="session", data={}),
 
     # Header toolbar
     html.Div(style={
@@ -394,6 +395,76 @@ app.layout = html.Div(style={
         },
         children=[make_chart_panel(i) for i in range(1, MAX_CHARTS + 1)],
     ),
+
+    # Tag Reference / Tag Manager — collapsible panel
+    html.Div(style={"marginTop": "12px"}, children=[
+        html.Button(
+            id="tag-panel-toggle",
+            children="Tag Manager \u25BC",
+            style={
+                **BTN_STYLE,
+                "marginLeft": "0", "padding": "6px 16px",
+                "fontSize": "13px", "color": ACCENT,
+                "width": "auto",
+            },
+        ),
+        html.Div(
+            id="tag-panel",
+            style={
+                "display": "none",
+                "backgroundColor": PANEL_BG,
+                "borderRadius": "8px",
+                "border": f"1px solid {BORDER_COLOR}",
+                "padding": "12px",
+                "marginTop": "6px",
+            },
+            children=[
+                html.Div(style={
+                    "display": "flex", "alignItems": "center",
+                    "marginBottom": "8px",
+                }, children=[
+                    html.Span("Tag Manager", style={
+                        "color": ACCENT, "fontSize": "14px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span(
+                        "  Set nicknames and units for loaded tags. "
+                        "Changes appear on chart legends and Y-axis labels.",
+                        style={"color": MUTED_TEXT, "fontSize": "11px",
+                               "marginLeft": "12px"},
+                    ),
+                ]),
+                # Table header
+                html.Div(style={
+                    "display": "grid",
+                    "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
+                    "gap": "6px",
+                    "padding": "4px 0",
+                    "borderBottom": f"1px solid {BORDER_COLOR}",
+                    "marginBottom": "4px",
+                }, children=[
+                    html.Span("Tag Code", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span("Current Name", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span("Nickname", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span("Unit", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                ]),
+                # Tag rows container (populated dynamically)
+                html.Div(id="tag-rows-container"),
+            ],
+        ),
+    ]),
 ])
 
 # ---------------------------------------------------------------------------
@@ -670,7 +741,7 @@ def on_sheet_selected(sheet_name, temp_path):
 # Figure builder
 # ---------------------------------------------------------------------------
 
-def _build_figure(df_slice, selected_tags, tag_map, x_revision=None):
+def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=None):
     fig = go.Figure()
     if df_slice is None or df_slice.empty:
         fig.update_layout(
@@ -683,6 +754,9 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None):
                               xref="paper", yref="paper", x=0.5, y=0.5)],
         )
         return fig
+
+    if nicknames is None:
+        nicknames = {}
 
     # Wider offsets so axes don't overlap (3 left, 3 right max)
     axis_configs = [
@@ -700,7 +774,14 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None):
         info = tag_map.get(tag_code, {})
         name = info.get("name", tag_code)
         units = info.get("units", "")
-        label = f"{name} [{units}]" if units else name
+
+        # Apply nickname/unit overrides from Tag Manager
+        tag_nn = nicknames.get(tag_code, {})
+        nickname = tag_nn.get("nickname", "")
+        unit_override = tag_nn.get("unit", "")
+        display_name = nickname if nickname else name
+        display_unit = unit_override if unit_override else units
+        label = f"{display_name} [{display_unit}]" if display_unit else display_name
         color = TRACE_COLORS[idx % len(TRACE_COLORS)]
         axis_num = idx + 1
         yaxis_key = "y" if axis_num == 1 else f"y{axis_num}"
@@ -790,13 +871,14 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "step", "index": _ci}, "value"),
         Input({"type": "scroll-left", "index": _ci}, "n_clicks"),
         Input({"type": "scroll-right", "index": _ci}, "n_clicks"),
+        Input("tag-nicknames", "data"),
         State({"type": "start-time", "index": _ci}, "data"),
         State("session-data", "data"),
         prevent_initial_call=True,
     )
     def update_chart(*args, _cid=_ci):
         tags = list(args[:NUM_SERIES])
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, start_time_iso, session_data = args[NUM_SERIES:]
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = args[NUM_SERIES:]
 
         # Issue #4: Read from per-session store instead of global state
         if not session_data:
@@ -845,7 +927,9 @@ for _ci in range(1, MAX_CHARTS + 1):
         mask = (df["Time"] >= start_time) & (df["Time"] <= end_time)
         df_slice = df.loc[mask]
 
-        fig = _build_figure(df_slice, tags, tag_map, x_revision=start_time.isoformat())
+        fig = _build_figure(df_slice, tags, tag_map,
+                            x_revision=start_time.isoformat(),
+                            nicknames=nn_data or {})
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -1044,6 +1128,242 @@ for _di in range(1, MAX_CHARTS + 1):
         return False, False, False, False, False, False, False
 
     toggle_controls.__name__ = f"toggle_controls_{_di}"
+
+
+# ---------------------------------------------------------------------------
+# Sync zoom: propagate master chart X-axis zoom/pan to all synced charts
+# ---------------------------------------------------------------------------
+
+# Build outputs: for each chart, update start-time, goto-date, goto-time, win-min, win-hr
+_zoom_sync_outputs = []
+for _zi in range(1, MAX_CHARTS + 1):
+    _zoom_sync_outputs.extend([
+        Output({"type": "start-time", "index": _zi}, "data", allow_duplicate=True),
+        Output({"type": "goto-date", "index": _zi}, "value", allow_duplicate=True),
+        Output({"type": "goto-time", "index": _zi}, "value", allow_duplicate=True),
+        Output({"type": "win-min", "index": _zi}, "value", allow_duplicate=True),
+        Output({"type": "win-hr", "index": _zi}, "value", allow_duplicate=True),
+    ])
+
+
+@app.callback(
+    _zoom_sync_outputs,
+    [Input({"type": "graph", "index": i}, "relayoutData") for i in range(1, MAX_CHARTS + 1)],
+    State("sync-state", "data"),
+    State("visible-charts", "data"),
+    prevent_initial_call=True,
+)
+def sync_zoom_from_master(*args):
+    """When the master chart is zoomed/panned on the X-axis, propagate the
+    new time range to all synced charts (including the master itself so its
+    controls stay consistent)."""
+    n_total = MAX_CHARTS * 5
+    relayout_list = args[:MAX_CHARTS]
+    sync_state = args[MAX_CHARTS]
+    visible = args[MAX_CHARTS + 1]
+
+    if not sync_state or not sync_state.get("active"):
+        return [no_update] * n_total
+
+    master = sync_state.get("master")
+    if master is None:
+        return [no_update] * n_total
+
+    ctx = callback_context
+    if not ctx.triggered:
+        return [no_update] * n_total
+
+    # Identify which graph triggered the callback
+    triggered = ctx.triggered[0]["prop_id"]
+    try:
+        prop = json.loads(triggered.rsplit(".", 1)[0])
+        triggered_chart = prop["index"]
+    except Exception:
+        return [no_update] * n_total
+
+    # Only react when the master chart fires the relayoutData
+    if triggered_chart != master:
+        return [no_update] * n_total
+
+    # Get the master's relayoutData
+    relayout = relayout_list[master - 1]  # 1-indexed → 0-indexed
+    if not relayout:
+        return [no_update] * n_total
+
+    x0 = relayout.get("xaxis.range[0]")
+    x1 = relayout.get("xaxis.range[1]")
+
+    if x0 is None or x1 is None:
+        return [no_update] * n_total
+
+    # Parse the range timestamps
+    try:
+        t0 = pd.Timestamp(x0)
+        t1 = pd.Timestamp(x1)
+    except Exception:
+        return [no_update] * n_total
+
+    if t1 <= t0:
+        return [no_update] * n_total
+
+    # Calculate window duration in minutes
+    delta = t1 - t0
+    total_minutes = delta.total_seconds() / 60.0
+    win_hr = int(total_minutes // 60)
+    win_min = round(total_minutes - win_hr * 60)
+
+    # Ensure at least 1 minute window
+    if win_hr == 0 and win_min == 0:
+        win_min = 1
+
+    start_iso = t0.isoformat()
+    date_str = t0.strftime("%Y-%m-%d")
+    time_str = t0.strftime("%H:%M")
+
+    # Build results: update all visible synced charts (including master)
+    results = []
+    for ci in range(1, MAX_CHARTS + 1):
+        if ci in (visible or []):
+            results.extend([start_iso, date_str, time_str, win_min, win_hr])
+        else:
+            results.extend([no_update] * 5)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tag Manager: toggle panel visibility
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("tag-panel", "style"),
+    Output("tag-panel-toggle", "children"),
+    Input("tag-panel-toggle", "n_clicks"),
+    State("tag-panel", "style"),
+    prevent_initial_call=True,
+)
+def toggle_tag_panel(n_clicks, current_style):
+    if not n_clicks:
+        return no_update, no_update
+    is_hidden = current_style.get("display") == "none"
+    new_style = {**current_style, "display": "block" if is_hidden else "none"}
+    label = "Tag Manager \u25B2" if is_hidden else "Tag Manager \u25BC"
+    return new_style, label
+
+
+# ---------------------------------------------------------------------------
+# Tag Manager: populate tag rows when data is loaded
+# ---------------------------------------------------------------------------
+
+UNIT_OPTIONS = [
+    {"label": u, "value": u}
+    for u in ["", "m\u00b3/hr", "%", "t/hr", "mbar", "\u00b0C", "MW", "bar", "kg/s", "RPM", "mm", "l/hr"]
+]
+
+
+@app.callback(
+    Output("tag-rows-container", "children"),
+    Input("data-stats", "children"),
+    State("tag-nicknames", "data"),
+)
+def populate_tag_rows(stats_text, saved_nicknames):
+    """Rebuild the tag table rows whenever new data is loaded."""
+    tag_map = APP_STATE.get("tag_map", {})
+    all_tags = APP_STATE.get("all_tags", [])
+    if not all_tags:
+        return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
+
+    if saved_nicknames is None:
+        saved_nicknames = {}
+
+    rows = []
+    for tag_code in all_tags:
+        info = tag_map.get(tag_code, {})
+        current_name = info.get("name", tag_code)
+        default_unit = info.get("units", "")
+
+        # Retrieve saved nickname/unit if any
+        saved = saved_nicknames.get(tag_code, {})
+        saved_nick = saved.get("nickname", "")
+        saved_unit = saved.get("unit", default_unit)
+
+        row = html.Div(style={
+            "display": "grid",
+            "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
+            "gap": "6px",
+            "padding": "3px 0",
+            "alignItems": "center",
+            "borderBottom": f"1px solid {GRID_COLOR}",
+        }, children=[
+            html.Span(tag_code, style={
+                "color": TEXT_COLOR, "fontSize": "11px",
+                "overflow": "hidden", "textOverflow": "ellipsis",
+                "whiteSpace": "nowrap",
+            }, title=tag_code),
+            html.Span(current_name, style={
+                "color": MUTED_TEXT, "fontSize": "11px",
+                "overflow": "hidden", "textOverflow": "ellipsis",
+                "whiteSpace": "nowrap",
+            }, title=current_name),
+            dcc.Input(
+                id={"type": "tag-nickname", "tag": tag_code},
+                type="text", value=saved_nick,
+                placeholder="Nickname...",
+                style={**INPUT_STYLE, "width": "100%", "fontSize": "11px"},
+                debounce=True,
+            ),
+            dcc.Dropdown(
+                id={"type": "tag-unit", "tag": tag_code},
+                options=UNIT_OPTIONS,
+                value=saved_unit,
+                placeholder="Unit...",
+                clearable=True,
+                style={**DROPDOWN_STYLE, "width": "100%", "fontSize": "11px"},
+                className="dark-dropdown",
+            ),
+        ])
+        rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Tag Manager: store nicknames/units when any input changes
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("tag-nicknames", "data"),
+    Input({"type": "tag-nickname", "tag": ALL}, "value"),
+    Input({"type": "tag-unit", "tag": ALL}, "value"),
+    State("tag-nicknames", "data"),
+    prevent_initial_call=True,
+)
+def update_tag_nicknames(nicknames, units, current_data):
+    """Persist nickname and unit edits into the session store."""
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+
+    if current_data is None:
+        current_data = {}
+
+    # Process all inputs via their pattern-matching IDs
+    nick_inputs = ctx.inputs_list[0] if ctx.inputs_list else []
+    unit_inputs = ctx.inputs_list[1] if len(ctx.inputs_list) > 1 else []
+
+    for inp in nick_inputs:
+        tag_code = inp["id"]["tag"]
+        val = inp.get("value", "")
+        if tag_code not in current_data:
+            current_data[tag_code] = {}
+        current_data[tag_code]["nickname"] = val or ""
+
+    for inp in unit_inputs:
+        tag_code = inp["id"]["tag"]
+        val = inp.get("value", "")
+        if tag_code not in current_data:
+            current_data[tag_code] = {}
+        current_data[tag_code]["unit"] = val or ""
+
+    return current_data
 
 
 # ---------------------------------------------------------------------------
