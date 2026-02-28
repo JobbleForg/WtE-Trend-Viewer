@@ -1264,11 +1264,14 @@ UNIT_OPTIONS = [
     Output("tag-rows-container", "children"),
     Input("data-stats", "children"),
     State("tag-nicknames", "data"),
+    State("session-data", "data"),
 )
-def populate_tag_rows(stats_text, saved_nicknames):
+def populate_tag_rows(stats_text, saved_nicknames, session_data):
     """Rebuild the tag table rows whenever new data is loaded."""
-    tag_map = APP_STATE.get("tag_map", {})
-    all_tags = APP_STATE.get("all_tags", [])
+    if not session_data:
+        return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
+    tag_map = session_data.get("tag_map", {})
+    all_tags = session_data.get("all_tags", [])
     if not all_tags:
         return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
 
