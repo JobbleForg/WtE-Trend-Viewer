@@ -293,6 +293,7 @@ app.layout = html.Div(style={
 }, children=[
     dcc.Store(id="temp-file-path", data=None),
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
+    dcc.Store(id="saved-setups", storage_type="local", data={}),
 
     # Header toolbar
     html.Div(style={
@@ -332,6 +333,35 @@ app.layout = html.Div(style={
             **BTN_STYLE, "marginLeft": "8px", "padding": "6px 14px",
             "fontSize": "13px", "color": "#3fb950",
         }),
+        # --- Save / Load Setup controls ---
+        html.Div(style={
+            "display": "flex", "alignItems": "center", "gap": "6px",
+            "marginLeft": "16px", "borderLeft": f"1px solid {BORDER_COLOR}",
+            "paddingLeft": "16px",
+        }, children=[
+            html.Span("Setup:", style=LABEL_STYLE),
+            dcc.Input(
+                id="setup-name-input", type="text", value="",
+                placeholder="Setup name...",
+                style={**INPUT_STYLE, "width": "140px"},
+                debounce=True,
+            ),
+            html.Button("Save", id="save-setup-btn", style={
+                **BTN_STYLE, "color": "#3fb950", "padding": "4px 14px",
+            }),
+            dcc.Dropdown(
+                id="load-setup-dropdown",
+                options=[], value=None,
+                placeholder="Load setup...", clearable=True,
+                style={**DROPDOWN_STYLE, "width": "180px"},
+                className="dark-dropdown",
+            ),
+            html.Button("Delete", id="delete-setup-btn", style={
+                **BTN_STYLE, "color": "#f85149", "padding": "4px 10px",
+            }),
+        ]),
+        html.Span(id="setup-status-msg", children="",
+                  style={"color": MUTED_TEXT, "fontSize": "11px"}),
     ]),
 
     # Data stats bar
@@ -798,6 +828,164 @@ def load_chart_package(pkg_num):
                 codes.append(None)
             return codes[:NUM_SERIES]
     return [no_update] * NUM_SERIES
+
+
+# ---------------------------------------------------------------------------
+# Save Setup callback — save current config to localStorage
+# ---------------------------------------------------------------------------
+
+# Gather all State inputs needed to capture current chart configuration
+_save_states = []
+for _c in range(1, MAX_CHARTS + 1):
+    for _s in range(1, NUM_SERIES + 1):
+        _save_states.append(State({"type": "series-dd", "chart": _c, "series": _s}, "value"))
+    _save_states.append(State({"type": "width-select", "index": _c}, "value"))
+    _save_states.append(State({"type": "height-select", "index": _c}, "value"))
+
+
+@app.callback(
+    Output("saved-setups", "data", allow_duplicate=True),
+    Output("setup-status-msg", "children", allow_duplicate=True),
+    Output("setup-name-input", "value"),
+    Input("save-setup-btn", "n_clicks"),
+    State("setup-name-input", "value"),
+    State("saved-setups", "data"),
+    State("visible-charts", "data"),
+    State("file-name-display", "children"),
+    State("sheet-select", "value"),
+    *_save_states,
+    prevent_initial_call=True,
+)
+def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *chart_args):
+    if not n_clicks:
+        return no_update, no_update, no_update
+    if not setup_name or not setup_name.strip():
+        return no_update, "Enter a name first.", no_update
+
+    setup_name = setup_name.strip()
+    if saved is None:
+        saved = {}
+
+    # Parse chart_args: for each chart, NUM_SERIES dropdown values + width + height
+    per_chart = NUM_SERIES + 2  # 6 series + width + height
+    charts_config = {}
+    for c in range(MAX_CHARTS):
+        offset = c * per_chart
+        series_vals = list(chart_args[offset:offset + NUM_SERIES])
+        width_val = chart_args[offset + NUM_SERIES]
+        height_val = chart_args[offset + NUM_SERIES + 1]
+        charts_config[str(c + 1)] = {
+            "series": series_vals,
+            "width": width_val,
+            "height": height_val,
+        }
+
+    saved[setup_name] = {
+        "visible": visible,
+        "charts": charts_config,
+        "file_name": file_name,
+        "sheet_name": sheet_name,
+    }
+    return saved, f"Saved \"{setup_name}\".", ""
+
+
+# ---------------------------------------------------------------------------
+# Update the load-setup dropdown options whenever saved-setups changes
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("load-setup-dropdown", "options"),
+    Input("saved-setups", "data"),
+)
+def update_setup_dropdown(saved):
+    if not saved:
+        return []
+    options = []
+    for name, cfg in saved.items():
+        ref_file = cfg.get("file_name", "")
+        ref_sheet = cfg.get("sheet_name", "")
+        label = name
+        if ref_file and ref_file != "No file loaded":
+            label += f"  ({ref_file}"
+            if ref_sheet:
+                label += f" / {ref_sheet}"
+            label += ")"
+        options.append({"label": label, "value": name})
+    return options
+
+
+# ---------------------------------------------------------------------------
+# Load Setup callback — restore chart config from localStorage
+# ---------------------------------------------------------------------------
+
+_load_setup_outputs = [
+    Output("visible-charts", "data", allow_duplicate=True),
+    Output("setup-status-msg", "children"),
+]
+for _c in range(1, MAX_CHARTS + 1):
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "series-dd", "chart": _c, "series": _s}, "value", allow_duplicate=True)
+        )
+    _load_setup_outputs.append(
+        Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "height-select", "index": _c}, "value", allow_duplicate=True)
+    )
+
+
+@app.callback(
+    _load_setup_outputs,
+    Input("load-setup-dropdown", "value"),
+    State("saved-setups", "data"),
+    prevent_initial_call=True,
+)
+def load_setup(selected_name, saved):
+    if not selected_name or not saved or selected_name not in saved:
+        return [no_update] * len(_load_setup_outputs)
+
+    cfg = saved[selected_name]
+    visible = cfg.get("visible", list(range(1, INITIAL_VISIBLE + 1)))
+    charts = cfg.get("charts", {})
+
+    results = [visible, f"Loaded \"{selected_name}\"."]
+
+    for c in range(1, MAX_CHARTS + 1):
+        chart_cfg = charts.get(str(c), {})
+        series_vals = chart_cfg.get("series", [None] * NUM_SERIES)
+        # Pad to NUM_SERIES if needed
+        while len(series_vals) < NUM_SERIES:
+            series_vals.append(None)
+        for s_val in series_vals[:NUM_SERIES]:
+            results.append(s_val)
+        results.append(chart_cfg.get("width", "half"))
+        results.append(chart_cfg.get("height", "300"))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Delete Setup callback — remove a saved setup from localStorage
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("saved-setups", "data", allow_duplicate=True),
+    Output("setup-status-msg", "children", allow_duplicate=True),
+    Output("load-setup-dropdown", "value", allow_duplicate=True),
+    Input("delete-setup-btn", "n_clicks"),
+    State("load-setup-dropdown", "value"),
+    State("saved-setups", "data"),
+    prevent_initial_call=True,
+)
+def delete_setup(n_clicks, selected_name, saved):
+    if not n_clicks:
+        return no_update, no_update, no_update
+    if not selected_name or not saved or selected_name not in saved:
+        return no_update, "Select a setup to delete.", no_update
+
+    del saved[selected_name]
+    return saved, f"Deleted \"{selected_name}\".", None
 
 
 # ---------------------------------------------------------------------------
