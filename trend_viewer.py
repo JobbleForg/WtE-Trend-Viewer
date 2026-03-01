@@ -316,6 +316,7 @@ app.layout = html.Div(style={
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
     dcc.Store(id="tag-nicknames", storage_type="session", data={}),
+    dcc.Store(id="custom-units", storage_type="session", data=[]),
 
     # Header toolbar
     html.Div(style={
@@ -426,7 +427,7 @@ app.layout = html.Div(style={
             children=[
                 html.Div(style={
                     "display": "flex", "alignItems": "center",
-                    "marginBottom": "8px",
+                    "marginBottom": "8px", "flexWrap": "wrap", "gap": "8px",
                 }, children=[
                     html.Span("Tag Manager", style={
                         "color": ACCENT, "fontSize": "14px",
@@ -438,6 +439,26 @@ app.layout = html.Div(style={
                         style={"color": MUTED_TEXT, "fontSize": "11px",
                                "marginLeft": "12px"},
                     ),
+                    html.Div(style={
+                        "display": "flex", "alignItems": "center",
+                        "gap": "4px", "marginLeft": "auto",
+                    }, children=[
+                        html.Span("Add unit:", style={
+                            **LABEL_STYLE, "fontSize": "11px",
+                        }),
+                        dcc.Input(
+                            id="custom-unit-input",
+                            type="text",
+                            placeholder="e.g. kPa",
+                            style={**INPUT_STYLE, "width": "90px",
+                                   "fontSize": "11px"},
+                            debounce=False,
+                        ),
+                        html.Button("+", id="add-unit-btn", style={
+                            **BTN_STYLE, "padding": "4px 10px",
+                            "fontSize": "12px", "minWidth": "auto",
+                        }),
+                    ]),
                 ]),
                 # Table header
                 html.Div(style={
@@ -1265,15 +1286,43 @@ UNIT_OPTIONS = [
     for u in ["", "m\u00b3/hr", "%", "t/hr", "mbar", "\u00b0C", "MW", "bar", "kg/s", "RPM", "mm", "l/hr"]
 ]
 
+# Set of built-in unit values for duplicate checking
+_BUILTIN_UNITS = {opt["value"] for opt in UNIT_OPTIONS}
+
+
+@app.callback(
+    Output("custom-units", "data"),
+    Output("custom-unit-input", "value"),
+    Input("add-unit-btn", "n_clicks"),
+    State("custom-unit-input", "value"),
+    State("custom-units", "data"),
+    prevent_initial_call=True,
+)
+def add_custom_unit(n_clicks, new_unit, custom_units):
+    """Add a user-defined unit to the custom-units store."""
+    if not n_clicks:
+        return no_update, no_update
+    if custom_units is None:
+        custom_units = []
+    if not new_unit or not new_unit.strip():
+        return no_update, no_update
+    unit = new_unit.strip()
+    if unit in _BUILTIN_UNITS or unit in custom_units:
+        # Already exists -- just clear the input
+        return no_update, ""
+    custom_units = custom_units + [unit]
+    return custom_units, ""
+
 
 @app.callback(
     Output("tag-rows-container", "children"),
     Input("data-stats", "children"),
+    Input("custom-units", "data"),
     State("tag-nicknames", "data"),
     State("session-data", "data"),
 )
-def populate_tag_rows(stats_text, saved_nicknames, session_data):
-    """Rebuild the tag table rows whenever new data is loaded."""
+def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
+    """Rebuild the tag table rows whenever new data is loaded or custom units change."""
     if not session_data:
         return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
     tag_map = session_data.get("tag_map", {})
@@ -1283,6 +1332,14 @@ def populate_tag_rows(stats_text, saved_nicknames, session_data):
 
     if saved_nicknames is None:
         saved_nicknames = {}
+
+    # Combine built-in units with any user-added custom units
+    if custom_units:
+        all_unit_options = UNIT_OPTIONS + [
+            {"label": u, "value": u} for u in custom_units
+        ]
+    else:
+        all_unit_options = UNIT_OPTIONS
 
     rows = []
     for tag_code in all_tags:
@@ -1322,7 +1379,7 @@ def populate_tag_rows(stats_text, saved_nicknames, session_data):
             ),
             dcc.Dropdown(
                 id={"type": "tag-unit", "tag": tag_code},
-                options=UNIT_OPTIONS,
+                options=all_unit_options,
                 value=saved_unit,
                 placeholder="Unit...",
                 clearable=True,
