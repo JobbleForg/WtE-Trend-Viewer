@@ -2,7 +2,7 @@
 Waste-to-Energy Plant Trend Viewer
 DCS-style trend display built with Dash + Plotly.
 Dynamically loads data from any Excel file and displays resizable trend charts.
-Each chart supports 6 independent series, each with its own Y-axis scale.
+Each chart supports 10 series with shared Y-axes for matching units.
 Charts can be added, removed, and resized.
 """
 
@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 # Constants
 # ---------------------------------------------------------------------------
 
-NUM_SERIES = 6
+NUM_SERIES = 10
 MAX_CHARTS = 8
 INITIAL_VISIBLE = 4
 
@@ -143,7 +143,10 @@ CHART_BG = "#0d1117"
 GRID_COLOR = "#30363d"
 TEXT_COLOR = "#c9d1d9"
 ACCENT = "#58a6ff"
-TRACE_COLORS = ["#58a6ff", "#3fb950", "#f0883e", "#bc8cff", "#f778ba", "#79c0ff"]
+TRACE_COLORS = [
+    "#58a6ff", "#3fb950", "#f0883e", "#bc8cff", "#f778ba",
+    "#79c0ff", "#ffa657", "#7ee787", "#ff7b72", "#d2a8ff",
+]
 BORDER_COLOR = "#30363d"
 MUTED_TEXT = "#8b949e"
 
@@ -193,9 +196,9 @@ def make_chart_panel(chart_id):
     hidden = chart_id > INITIAL_VISIBLE
 
     dropdown_rows = []
-    for row_start in (1, 4):
+    for row_start in (1, 6):
         row_children = []
-        for s in range(row_start, row_start + 3):
+        for s in range(row_start, min(row_start + 5, NUM_SERIES + 1)):
             color_dot = TRACE_COLORS[s - 1]
             row_children.extend([
                 html.Span(f"S{s}", style={
@@ -207,12 +210,13 @@ def make_chart_panel(chart_id):
                     id={"type": "series-dd", "chart": chart_id, "series": s},
                     options=[], value=None,
                     placeholder=f"Series {s}", clearable=True,
-                    style=DROPDOWN_STYLE, className="dark-dropdown",
+                    style={**DROPDOWN_STYLE, "width": "170px"},
+                    className="dark-dropdown",
                 ),
             ])
         dropdown_rows.append(html.Div(style={
-            "display": "flex", "alignItems": "center", "gap": "6px",
-            "marginTop": "4px",
+            "display": "flex", "alignItems": "center", "gap": "4px",
+            "marginTop": "4px", "flexWrap": "wrap",
         }, children=row_children))
 
     return html.Div(
@@ -768,6 +772,11 @@ def on_sheet_selected(sheet_name, temp_path):
 # ---------------------------------------------------------------------------
 
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=None):
+    """Build a Plotly figure.  Tags that share the same effective unit are
+    drawn on a single shared Y-axis so the chart stays readable even with
+    up to 10 active series."""
+    from collections import OrderedDict
+
     fig = go.Figure()
     if df_slice is None or df_slice.empty:
         fig.update_layout(
@@ -784,49 +793,90 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
     if nicknames is None:
         nicknames = {}
 
-    # Wider offsets so axes don't overlap (3 left, 3 right max)
-    axis_configs = [
-        {"side": "left",  "offset": 0.0},
-        {"side": "right", "offset": 0.0},
-        {"side": "left",  "offset": 0.05},
-        {"side": "right", "offset": 0.05},
-        {"side": "left",  "offset": 0.10},
-        {"side": "right", "offset": 0.10},
-    ]
-    active_axes = []
+    # --- Step 1: Gather info for every active series -----------------------
+    active_series = []  # (slot_idx, tag_code, display_name, display_unit, color, info)
     for idx, tag_code in enumerate(selected_tags):
         if not tag_code or tag_code not in df_slice.columns:
             continue
         info = tag_map.get(tag_code, {})
         name = info.get("name", tag_code)
         units = info.get("units", "")
-
-        # Apply nickname/unit overrides from Tag Manager
         tag_nn = nicknames.get(tag_code, {})
         nickname = tag_nn.get("nickname", "")
         unit_override = tag_nn.get("unit", "")
         display_name = nickname if nickname else name
         display_unit = unit_override if unit_override else units
-        label = f"{display_name} [{display_unit}]" if display_unit else display_name
         color = TRACE_COLORS[idx % len(TRACE_COLORS)]
-        axis_num = idx + 1
-        yaxis_key = "y" if axis_num == 1 else f"y{axis_num}"
-        fig.add_trace(go.Scattergl(
-            x=df_slice["Time"], y=df_slice[tag_code],
-            name=label, yaxis=yaxis_key,
-            line=dict(color=color, width=1.5), mode="lines",
-        ))
-        y_range = None
-        y_hi, y_lo = info.get("y_high"), info.get("y_low")
-        if y_hi is not None and y_lo is not None:
-            y_range = [y_lo, y_hi]
-        cfg = axis_configs[idx]
+        active_series.append((idx, tag_code, display_name, display_unit, color, info))
+
+    if not active_series:
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
+            font=dict(family="Consolas, monospace", size=11, color=TEXT_COLOR),
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            annotations=[dict(text="Select tags to display", showarrow=False,
+                              font=dict(size=14, color=MUTED_TEXT),
+                              xref="paper", yref="paper", x=0.5, y=0.5)],
+        )
+        return fig
+
+    # --- Step 2: Group series by effective unit ----------------------------
+    # Tags with the SAME non-empty unit share one Y-axis.
+    # Tags with no unit each get their own axis.
+    unit_groups = OrderedDict()
+    for s in active_series:
+        unit_key = s[3] if s[3] else f"_no_unit_{s[1]}"
+        if unit_key not in unit_groups:
+            unit_groups[unit_key] = []
+        unit_groups[unit_key].append(s)
+
+    # --- Step 3: Assign one Y-axis per unit group, alternating L/R ---------
+    unit_to_axis = {}
+    active_axes = []
+    for axis_idx, (unit_key, members) in enumerate(unit_groups.items()):
+        axis_num = axis_idx + 1
+        # Alternate left / right, stacking outward
+        if axis_idx % 2 == 0:
+            side, offset = "left", (axis_idx // 2) * 0.05
+        else:
+            side, offset = "right", (axis_idx // 2) * 0.05
+
+        # Axis colour: use trace colour when solo, neutral when shared
+        axis_color = members[0][4] if len(members) == 1 else TEXT_COLOR
+
+        # Axis label: "Name [unit]" when solo, just "[unit]" when shared
+        display_unit = members[0][3]
+        if len(members) == 1:
+            label = f"{members[0][2]} [{display_unit}]" if display_unit else members[0][2]
+        else:
+            label = f"[{display_unit}]" if display_unit else ""
+
+        # Y-range: union of all members' y_high/y_low
+        y_hi_vals = [m[5].get("y_high") for m in members if m[5].get("y_high") is not None]
+        y_lo_vals = [m[5].get("y_low") for m in members if m[5].get("y_low") is not None]
+        y_range = [min(y_lo_vals), max(y_hi_vals)] if y_hi_vals and y_lo_vals else None
+
+        unit_to_axis[unit_key] = axis_num
         active_axes.append({
-            "num": axis_num, "side": cfg["side"], "offset": cfg["offset"],
-            "color": color, "range": y_range, "label": label,
-            "tag_code": tag_code,
+            "num": axis_num, "side": side, "offset": offset,
+            "color": axis_color, "range": y_range, "label": label,
+            "unit_key": unit_key,
         })
 
+    # --- Step 4: Add traces, each referencing its shared axis --------------
+    for (idx, tag_code, display_name, display_unit, color, info) in active_series:
+        unit_key = display_unit if display_unit else f"_no_unit_{tag_code}"
+        axis_num = unit_to_axis[unit_key]
+        yaxis_key = "y" if axis_num == 1 else f"y{axis_num}"
+        trace_label = f"{display_name} [{display_unit}]" if display_unit else display_name
+        fig.add_trace(go.Scattergl(
+            x=df_slice["Time"], y=df_slice[tag_code],
+            name=trace_label, yaxis=yaxis_key,
+            line=dict(color=color, width=1.5), mode="lines",
+        ))
+
+    # --- Step 5: Build Y-axis layout dicts ---------------------------------
     max_left = max((a["offset"] for a in active_axes if a["side"] == "left"), default=0)
     max_right = max((a["offset"] for a in active_axes if a["side"] == "right"), default=0)
     x_domain = [max_left, 1.0 - max_right]
@@ -834,8 +884,6 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
     yaxis_layouts = {}
     for ax in active_axes:
         key = "yaxis" if ax["num"] == 1 else f"yaxis{ax['num']}"
-        # Left axes stack outward (lower position = further left)
-        # Right axes stack outward (higher position = further right)
         if ax["side"] == "left":
             position = max_left - ax["offset"]
         else:
@@ -845,8 +893,7 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
             tickfont=dict(color=ax["color"], size=9),
             gridcolor=GRID_COLOR if ax["num"] == 1 else "rgba(0,0,0,0)",
             showgrid=(ax["num"] == 1), zeroline=False, side=ax["side"],
-            # Preserve user zoom per axis; resets only when the tag changes
-            uirevision=ax["tag_code"],
+            uirevision=ax["unit_key"],
         )
         if ax["range"]:
             layout["range"] = ax["range"]
@@ -1510,7 +1557,7 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
         saved = {}
 
     # Parse chart_args: for each chart, NUM_SERIES dropdown values + width + height
-    per_chart = NUM_SERIES + 2  # 6 series + width + height
+    per_chart = NUM_SERIES + 2  # series + width + height
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
