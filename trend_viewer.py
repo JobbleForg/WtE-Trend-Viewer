@@ -218,9 +218,18 @@ def make_chart_panel(chart_id):
                     options=[{"label": "Own", "value": "own"}],
                     value=[],
                     style={"fontSize": "10px", "color": MUTED_TEXT,
+                           "display": "inline-flex", "alignItems": "center"},
+                    className="own-scale-check",
+                    inline=True,
+                ),
+                dcc.Checklist(
+                    id={"type": "lock-scale", "chart": chart_id, "series": s},
+                    options=[{"label": "\U0001F512", "value": "lock"}],
+                    value=[],
+                    style={"fontSize": "10px", "color": MUTED_TEXT,
                            "display": "inline-flex", "alignItems": "center",
                            "marginRight": "2px"},
-                    className="own-scale-check",
+                    className="lock-scale-check",
                     inline=True,
                 ),
             ])
@@ -562,6 +571,17 @@ app.index_string = '''<!DOCTYPE html>
         .own-scale-check input[type="checkbox"] {
             margin-right: 2px;
         }
+        /* Lock-scale checkbox styling */
+        .lock-scale-check label {
+            color: ''' + MUTED_TEXT + ''' !important;
+            font-size: 10px !important;
+            cursor: pointer;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .lock-scale-check input[type="checkbox"] {
+            margin-right: 1px;
+        }
     </style>
 </head>
 <body>
@@ -793,12 +813,13 @@ def on_sheet_selected(sheet_name, temp_path):
 # ---------------------------------------------------------------------------
 
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
-                   nicknames=None, own_scale_flags=None):
+                   nicknames=None, own_scale_flags=None, lock_scale_flags=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
     up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
     set are forced onto their own independent axis even when the unit matches
-    another series."""
+    another series.  Series with ``lock_scale_flags[idx]`` set have their
+    Y-axis locked (``fixedrange=True``) so it cannot be zoomed/panned."""
     from collections import OrderedDict
 
     fig = go.Figure()
@@ -818,6 +839,8 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         nicknames = {}
     if own_scale_flags is None:
         own_scale_flags = [False] * len(selected_tags)
+    if lock_scale_flags is None:
+        lock_scale_flags = [False] * len(selected_tags)
 
     # --- Step 1: Gather info for every active series -----------------------
     active_series = []  # (slot_idx, tag_code, display_name, display_unit, color, info)
@@ -899,11 +922,17 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         y_lo_vals = [m[5].get("y_low") for m in members if m[5].get("y_low") is not None]
         y_range = [min(y_lo_vals), max(y_hi_vals)] if y_hi_vals and y_lo_vals else None
 
+        # Check if any member in this group has its scale locked
+        is_locked = any(
+            lock_scale_flags[m[0]] if m[0] < len(lock_scale_flags) else False
+            for m in members
+        )
+
         unit_to_axis[unit_key] = axis_num
         active_axes.append({
             "num": axis_num, "side": side, "offset": offset,
             "color": axis_color, "range": y_range, "label": label,
-            "unit_key": unit_key,
+            "unit_key": unit_key, "locked": is_locked,
         })
 
     # --- Step 4: Add traces, each referencing its shared axis --------------
@@ -940,6 +969,7 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             gridcolor=GRID_COLOR if ax["num"] == 1 else "rgba(0,0,0,0)",
             showgrid=(ax["num"] == 1), zeroline=False, side=ax["side"],
             uirevision=ax["unit_key"],
+            fixedrange=ax.get("locked", False),
         )
         if ax["range"]:
             layout["range"] = ax["range"]
@@ -980,6 +1010,10 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "own-scale", "chart": _ci, "series": s}, "value")
         for s in range(1, NUM_SERIES + 1)
     ]
+    _lock_scale_inputs = [
+        Input({"type": "lock-scale", "chart": _ci, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
 
     @app.callback(
         Output({"type": "graph", "index": _ci}, "figure"),
@@ -988,6 +1022,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         Output({"type": "goto-time", "index": _ci}, "value", allow_duplicate=True),
         *_series_inputs,
         *_own_scale_inputs,
+        *_lock_scale_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
         Input({"type": "win-min", "index": _ci}, "value"),
@@ -1004,7 +1039,9 @@ for _ci in range(1, MAX_CHARTS + 1):
         tags = list(args[:NUM_SERIES])
         own_checklists = list(args[NUM_SERIES:NUM_SERIES * 2])
         own_flags = [("own" in (v or [])) for v in own_checklists]
-        rest = args[NUM_SERIES * 2:]
+        lock_checklists = list(args[NUM_SERIES * 2:NUM_SERIES * 3])
+        lock_flags = [("lock" in (v or [])) for v in lock_checklists]
+        rest = args[NUM_SERIES * 3:]
         goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = rest
 
         # Issue #4: Read from per-session store instead of global state
@@ -1057,7 +1094,8 @@ for _ci in range(1, MAX_CHARTS + 1):
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
                             nicknames=nn_data or {},
-                            own_scale_flags=own_flags)
+                            own_scale_flags=own_flags,
+                            lock_scale_flags=lock_flags)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -1586,6 +1624,8 @@ for _c in range(1, MAX_CHARTS + 1):
         _save_states.append(State({"type": "series-dd", "chart": _c, "series": _s}, "value"))
     for _s in range(1, NUM_SERIES + 1):
         _save_states.append(State({"type": "own-scale", "chart": _c, "series": _s}, "value"))
+    for _s in range(1, NUM_SERIES + 1):
+        _save_states.append(State({"type": "lock-scale", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
 
@@ -1613,18 +1653,20 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
     if saved is None:
         saved = {}
 
-    # Parse chart_args: for each chart, NUM_SERIES dd values + NUM_SERIES own-scale + width + height
-    per_chart = NUM_SERIES * 2 + 2  # series + own-scale + width + height
+    # Parse chart_args: series + own-scale + lock-scale + width + height per chart
+    per_chart = NUM_SERIES * 3 + 2
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
         series_vals = list(chart_args[offset:offset + NUM_SERIES])
         own_vals = list(chart_args[offset + NUM_SERIES:offset + NUM_SERIES * 2])
-        width_val = chart_args[offset + NUM_SERIES * 2]
-        height_val = chart_args[offset + NUM_SERIES * 2 + 1]
+        lock_vals = list(chart_args[offset + NUM_SERIES * 2:offset + NUM_SERIES * 3])
+        width_val = chart_args[offset + NUM_SERIES * 3]
+        height_val = chart_args[offset + NUM_SERIES * 3 + 1]
         charts_config[str(c + 1)] = {
             "series": series_vals,
             "own_scale": own_vals,
+            "lock_scale": lock_vals,
             "width": width_val,
             "height": height_val,
         }
@@ -1680,6 +1722,10 @@ for _c in range(1, MAX_CHARTS + 1):
         _load_setup_outputs.append(
             Output({"type": "own-scale", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "lock-scale", "chart": _c, "series": _s}, "value", allow_duplicate=True)
+        )
     _load_setup_outputs.append(
         Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
     )
@@ -1717,6 +1763,12 @@ def load_setup(selected_name, saved):
             own_vals.append([])
         for ov in own_vals[:NUM_SERIES]:
             results.append(ov if ov else [])
+        # Restore lock-scale flags (backward-compatible: default to [] if missing)
+        lock_vals = chart_cfg.get("lock_scale", [[] for _ in range(NUM_SERIES)])
+        while len(lock_vals) < NUM_SERIES:
+            lock_vals.append([])
+        for lv in lock_vals[:NUM_SERIES]:
+            results.append(lv if lv else [])
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", "300"))
 
