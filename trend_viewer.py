@@ -14,7 +14,7 @@ import json
 import tempfile
 from io import StringIO
 import pandas as pd
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, ALL, MATCH
 import plotly.graph_objects as go
 
@@ -1619,6 +1619,54 @@ def update_tag_nicknames(nicknames, units, current_data):
 
 
 # ---------------------------------------------------------------------------
+# Update series dropdown labels when nicknames/units change (Issue #14)
+# ---------------------------------------------------------------------------
+
+_nickname_dd_outputs = []
+for _c in range(1, MAX_CHARTS + 1):
+    for _s in range(1, NUM_SERIES + 1):
+        _nickname_dd_outputs.append(
+            Output({"type": "series-dd", "chart": _c, "series": _s}, "options", allow_duplicate=True)
+        )
+
+
+@app.callback(
+    _nickname_dd_outputs,
+    Input("tag-nicknames", "data"),
+    State("session-data", "data"),
+    prevent_initial_call=True,
+)
+def update_dropdown_labels(nn_data, session_data):
+    """Rebuild series dropdown options when tag nicknames or units change."""
+    if not session_data:
+        return [no_update] * len(_nickname_dd_outputs)
+    tag_map = session_data.get("tag_map", {})
+    all_tags = session_data.get("all_tags", [])
+    if not all_tags:
+        return [no_update] * len(_nickname_dd_outputs)
+
+    if nn_data is None:
+        nn_data = {}
+
+    # Build updated options incorporating nickname/unit overrides
+    tag_options = []
+    for c in all_tags:
+        info = tag_map.get(c, {})
+        nn = nn_data.get(c, {})
+        nickname = nn.get("nickname", "")
+        unit_override = nn.get("unit", "")
+
+        name = nickname if nickname else info.get("name", c)
+        units = unit_override if unit_override else info.get("units", "")
+        unit_str = f" [{units}]" if units else ""
+        label = f"{c} - {name}{unit_str}"
+        tag_options.append({"label": label, "value": c})
+
+    # Return same updated options list for every series dropdown
+    return [tag_options] * len(_nickname_dd_outputs)
+
+
+# ---------------------------------------------------------------------------
 # Chart Package callback — loads into chart 1
 # ---------------------------------------------------------------------------
 
@@ -1676,6 +1724,12 @@ for _c in range(1, MAX_CHARTS + 1):
         _save_states.append(State({"type": "filter-window", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
+    _save_states.append(State({"type": "start-time", "index": _c}, "data"))
+    _save_states.append(State({"type": "goto-date", "index": _c}, "value"))
+    _save_states.append(State({"type": "goto-time", "index": _c}, "value"))
+    _save_states.append(State({"type": "win-min", "index": _c}, "value"))
+    _save_states.append(State({"type": "win-hr", "index": _c}, "value"))
+    _save_states.append(State({"type": "step", "index": _c}, "value"))
 
 
 @app.callback(
@@ -1688,10 +1742,11 @@ for _c in range(1, MAX_CHARTS + 1):
     State("visible-charts", "data"),
     State("file-name-display", "children"),
     State("sheet-select", "value"),
+    State("sync-state", "data"),
     *_save_states,
     prevent_initial_call=True,
 )
-def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *chart_args):
+def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, sync_state, *chart_args):
     if not n_clicks:
         return no_update, no_update, no_update
     if not setup_name or not setup_name.strip():
@@ -1701,8 +1756,8 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
     if saved is None:
         saved = {}
 
-    # Parse chart_args: series + own-scale + lock-scale + filter-window + width + height per chart
-    per_chart = NUM_SERIES * 4 + 2
+    # Parse chart_args: series + own-scale + lock-scale + filter-window + width + height + time settings per chart
+    per_chart = NUM_SERIES * 4 + 8
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
@@ -1712,6 +1767,12 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
         filter_vals = list(chart_args[offset + NUM_SERIES * 3:offset + NUM_SERIES * 4])
         width_val = chart_args[offset + NUM_SERIES * 4]
         height_val = chart_args[offset + NUM_SERIES * 4 + 1]
+        start_time_val = chart_args[offset + NUM_SERIES * 4 + 2]
+        goto_date_val = chart_args[offset + NUM_SERIES * 4 + 3]
+        goto_time_val = chart_args[offset + NUM_SERIES * 4 + 4]
+        win_min_val = chart_args[offset + NUM_SERIES * 4 + 5]
+        win_hr_val = chart_args[offset + NUM_SERIES * 4 + 6]
+        step_val = chart_args[offset + NUM_SERIES * 4 + 7]
         charts_config[str(c + 1)] = {
             "series": series_vals,
             "own_scale": own_vals,
@@ -1719,6 +1780,12 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
             "filter_window": filter_vals,
             "width": width_val,
             "height": height_val,
+            "start_time": start_time_val,
+            "goto_date": goto_date_val,
+            "goto_time": goto_time_val,
+            "win_min": win_min_val,
+            "win_hr": win_hr_val,
+            "step": step_val,
         }
 
     saved[setup_name] = {
@@ -1726,8 +1793,10 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
         "charts": charts_config,
         "file_name": file_name,
         "sheet_name": sheet_name,
+        "sync_state": sync_state,
     }
-    return saved, f"Saved \"{setup_name}\".", ""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return saved, f"Saved \"{setup_name}\" at {now}.", ""
 
 
 # ---------------------------------------------------------------------------
@@ -1762,6 +1831,7 @@ def update_setup_dropdown(saved):
 _load_setup_outputs = [
     Output("visible-charts", "data", allow_duplicate=True),
     Output("setup-status-msg", "children", allow_duplicate=True),
+    Output("sync-state", "data", allow_duplicate=True),
 ]
 for _c in range(1, MAX_CHARTS + 1):
     for _s in range(1, NUM_SERIES + 1):
@@ -1786,6 +1856,24 @@ for _c in range(1, MAX_CHARTS + 1):
     _load_setup_outputs.append(
         Output({"type": "height-select", "index": _c}, "value", allow_duplicate=True)
     )
+    _load_setup_outputs.append(
+        Output({"type": "start-time", "index": _c}, "data", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "goto-date", "index": _c}, "value", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "goto-time", "index": _c}, "value", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "win-min", "index": _c}, "value", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "win-hr", "index": _c}, "value", allow_duplicate=True)
+    )
+    _load_setup_outputs.append(
+        Output({"type": "step", "index": _c}, "value", allow_duplicate=True)
+    )
 
 
 @app.callback(
@@ -1802,7 +1890,8 @@ def load_setup(selected_name, saved):
     visible = cfg.get("visible", list(range(1, INITIAL_VISIBLE + 1)))
     charts = cfg.get("charts", {})
 
-    results = [visible, f"Loaded \"{selected_name}\"."]
+    sync_state = cfg.get("sync_state", {"active": False, "master": None})
+    results = [visible, f"Loaded \"{selected_name}\".", sync_state]
 
     for c in range(1, MAX_CHARTS + 1):
         chart_cfg = charts.get(str(c), {})
@@ -1831,6 +1920,13 @@ def load_setup(selected_name, saved):
             results.append(fv if fv else 1)
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", "300"))
+        # Restore time settings (backward-compatible: sensible defaults)
+        results.append(chart_cfg.get("start_time", None))
+        results.append(chart_cfg.get("goto_date", ""))
+        results.append(chart_cfg.get("goto_time", "00:00"))
+        results.append(chart_cfg.get("win_min", 60))
+        results.append(chart_cfg.get("win_hr", 0))
+        results.append(chart_cfg.get("step", 15))
 
     return results
 
