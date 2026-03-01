@@ -210,8 +210,18 @@ def make_chart_panel(chart_id):
                     id={"type": "series-dd", "chart": chart_id, "series": s},
                     options=[], value=None,
                     placeholder=f"Series {s}", clearable=True,
-                    style={**DROPDOWN_STYLE, "width": "170px"},
+                    style={**DROPDOWN_STYLE, "width": "150px"},
                     className="dark-dropdown",
+                ),
+                dcc.Checklist(
+                    id={"type": "own-scale", "chart": chart_id, "series": s},
+                    options=[{"label": "Own", "value": "own"}],
+                    value=[],
+                    style={"fontSize": "10px", "color": MUTED_TEXT,
+                           "display": "inline-flex", "alignItems": "center",
+                           "marginRight": "2px"},
+                    className="own-scale-check",
+                    inline=True,
                 ),
             ])
         dropdown_rows.append(html.Div(style={
@@ -541,6 +551,17 @@ app.index_string = '''<!DOCTYPE html>
             opacity: 0.4 !important;
             cursor: not-allowed !important;
         }
+        /* Own-scale checkbox styling */
+        .own-scale-check label {
+            color: ''' + MUTED_TEXT + ''' !important;
+            font-size: 10px !important;
+            cursor: pointer;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .own-scale-check input[type="checkbox"] {
+            margin-right: 2px;
+        }
     </style>
 </head>
 <body>
@@ -771,10 +792,13 @@ def on_sheet_selected(sheet_name, temp_path):
 # Figure builder
 # ---------------------------------------------------------------------------
 
-def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=None):
+def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
+                   nicknames=None, own_scale_flags=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
-    up to 10 active series."""
+    up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
+    set are forced onto their own independent axis even when the unit matches
+    another series."""
     from collections import OrderedDict
 
     fig = go.Figure()
@@ -792,6 +816,8 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
 
     if nicknames is None:
         nicknames = {}
+    if own_scale_flags is None:
+        own_scale_flags = [False] * len(selected_tags)
 
     # --- Step 1: Gather info for every active series -----------------------
     active_series = []  # (slot_idx, tag_code, display_name, display_unit, color, info)
@@ -822,11 +848,18 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
         return fig
 
     # --- Step 2: Group series by effective unit ----------------------------
-    # Tags with the SAME non-empty unit share one Y-axis.
-    # Tags with no unit each get their own axis.
+    # Tags with the SAME non-empty unit share one Y-axis *unless* the user
+    # has ticked "Own" for that series slot.
+    # Tags with no unit, or with "Own" checked, each get their own axis.
     unit_groups = OrderedDict()
     for s in active_series:
-        unit_key = s[3] if s[3] else f"_no_unit_{s[1]}"
+        slot_idx = s[0]
+        is_own = own_scale_flags[slot_idx] if slot_idx < len(own_scale_flags) else False
+        if is_own or not s[3]:
+            # Force own axis — unique key per series
+            unit_key = f"_own_{s[1]}"
+        else:
+            unit_key = s[3]
         if unit_key not in unit_groups:
             unit_groups[unit_key] = []
         unit_groups[unit_key].append(s)
@@ -845,12 +878,21 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
         # Axis colour: use trace colour when solo, neutral when shared
         axis_color = members[0][4] if len(members) == 1 else TEXT_COLOR
 
-        # Axis label: "Name [unit]" when solo, just "[unit]" when shared
+        # Build axis label with series indicators
         display_unit = members[0][3]
+        series_tags = ", ".join(f"S{m[0] + 1}" for m in members)
         if len(members) == 1:
-            label = f"{members[0][2]} [{display_unit}]" if display_unit else members[0][2]
+            name_part = members[0][2]
+            if display_unit:
+                label = f"{name_part} [{display_unit}]"
+            else:
+                label = name_part
         else:
-            label = f"[{display_unit}]" if display_unit else ""
+            # Shared axis: show which series share it
+            if display_unit:
+                label = f"{series_tags} [{display_unit}]"
+            else:
+                label = series_tags
 
         # Y-range: union of all members' y_high/y_low
         y_hi_vals = [m[5].get("y_high") for m in members if m[5].get("y_high") is not None]
@@ -866,7 +908,11 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None, nicknames=N
 
     # --- Step 4: Add traces, each referencing its shared axis --------------
     for (idx, tag_code, display_name, display_unit, color, info) in active_series:
-        unit_key = display_unit if display_unit else f"_no_unit_{tag_code}"
+        is_own = own_scale_flags[idx] if idx < len(own_scale_flags) else False
+        if is_own or not display_unit:
+            unit_key = f"_own_{tag_code}"
+        else:
+            unit_key = display_unit
         axis_num = unit_to_axis[unit_key]
         yaxis_key = "y" if axis_num == 1 else f"y{axis_num}"
         trace_label = f"{display_name} [{display_unit}]" if display_unit else display_name
@@ -930,6 +976,10 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "series-dd", "chart": _ci, "series": s}, "value")
         for s in range(1, NUM_SERIES + 1)
     ]
+    _own_scale_inputs = [
+        Input({"type": "own-scale", "chart": _ci, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
 
     @app.callback(
         Output({"type": "graph", "index": _ci}, "figure"),
@@ -937,6 +987,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         Output({"type": "goto-date", "index": _ci}, "value", allow_duplicate=True),
         Output({"type": "goto-time", "index": _ci}, "value", allow_duplicate=True),
         *_series_inputs,
+        *_own_scale_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
         Input({"type": "win-min", "index": _ci}, "value"),
@@ -951,7 +1002,10 @@ for _ci in range(1, MAX_CHARTS + 1):
     )
     def update_chart(*args, _cid=_ci):
         tags = list(args[:NUM_SERIES])
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = args[NUM_SERIES:]
+        own_checklists = list(args[NUM_SERIES:NUM_SERIES * 2])
+        own_flags = [("own" in (v or [])) for v in own_checklists]
+        rest = args[NUM_SERIES * 2:]
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = rest
 
         # Issue #4: Read from per-session store instead of global state
         if not session_data:
@@ -1002,7 +1056,8 @@ for _ci in range(1, MAX_CHARTS + 1):
 
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
-                            nicknames=nn_data or {})
+                            nicknames=nn_data or {},
+                            own_scale_flags=own_flags)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -1529,6 +1584,8 @@ _save_states = []
 for _c in range(1, MAX_CHARTS + 1):
     for _s in range(1, NUM_SERIES + 1):
         _save_states.append(State({"type": "series-dd", "chart": _c, "series": _s}, "value"))
+    for _s in range(1, NUM_SERIES + 1):
+        _save_states.append(State({"type": "own-scale", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
 
@@ -1556,16 +1613,18 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
     if saved is None:
         saved = {}
 
-    # Parse chart_args: for each chart, NUM_SERIES dropdown values + width + height
-    per_chart = NUM_SERIES + 2  # series + width + height
+    # Parse chart_args: for each chart, NUM_SERIES dd values + NUM_SERIES own-scale + width + height
+    per_chart = NUM_SERIES * 2 + 2  # series + own-scale + width + height
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
         series_vals = list(chart_args[offset:offset + NUM_SERIES])
-        width_val = chart_args[offset + NUM_SERIES]
-        height_val = chart_args[offset + NUM_SERIES + 1]
+        own_vals = list(chart_args[offset + NUM_SERIES:offset + NUM_SERIES * 2])
+        width_val = chart_args[offset + NUM_SERIES * 2]
+        height_val = chart_args[offset + NUM_SERIES * 2 + 1]
         charts_config[str(c + 1)] = {
             "series": series_vals,
+            "own_scale": own_vals,
             "width": width_val,
             "height": height_val,
         }
@@ -1617,6 +1676,10 @@ for _c in range(1, MAX_CHARTS + 1):
         _load_setup_outputs.append(
             Output({"type": "series-dd", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "own-scale", "chart": _c, "series": _s}, "value", allow_duplicate=True)
+        )
     _load_setup_outputs.append(
         Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
     )
@@ -1644,11 +1707,16 @@ def load_setup(selected_name, saved):
     for c in range(1, MAX_CHARTS + 1):
         chart_cfg = charts.get(str(c), {})
         series_vals = chart_cfg.get("series", [None] * NUM_SERIES)
-        # Pad to NUM_SERIES if needed
         while len(series_vals) < NUM_SERIES:
             series_vals.append(None)
         for s_val in series_vals[:NUM_SERIES]:
             results.append(s_val)
+        # Restore own-scale flags (backward-compatible: default to [] if missing)
+        own_vals = chart_cfg.get("own_scale", [[] for _ in range(NUM_SERIES)])
+        while len(own_vals) < NUM_SERIES:
+            own_vals.append([])
+        for ov in own_vals[:NUM_SERIES]:
+            results.append(ov if ov else [])
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", "300"))
 
