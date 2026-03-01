@@ -10,7 +10,9 @@ Grabs excel data which can be viewed in the browser dashboard.
 git clone https://github.com/JobbleForg/WtE-Trend-Viewer.git
 cd WtE-Trend-Viewer
 
-# Install dependencies
+# Create a virtual environment and install dependencies
+python3 -m venv venv
+source venv/bin/activate
 pip install dash plotly pandas openpyxl
 ```
 
@@ -26,6 +28,7 @@ git pull origin main
 ### Start the server
 
 ```bash
+source venv/bin/activate
 python trend_viewer.py
 ```
 
