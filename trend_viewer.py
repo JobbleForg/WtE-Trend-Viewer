@@ -289,6 +289,30 @@ def make_chart_panel(chart_id):
                 style={"height": "300px"},
             ),
             *dropdown_rows,
+            # Filter row for rolling mean (Issue #18)
+            html.Div(style={
+                "display": "flex", "alignItems": "center", "gap": "4px",
+                "marginTop": "4px", "flexWrap": "wrap",
+            }, children=[
+                html.Span("Filter:", style={
+                    **LABEL_STYLE, "fontSize": "11px", "color": MUTED_TEXT,
+                }),
+            ] + [
+                item for s in range(1, NUM_SERIES + 1) for item in [
+                    html.Span(f"S{s}", style={
+                        "color": TRACE_COLORS[s - 1], "fontSize": "10px",
+                        "fontWeight": "bold",
+                        "marginLeft": "6px" if s > 1 else "0",
+                    }),
+                    dcc.Input(
+                        id={"type": "filter-window", "chart": chart_id, "series": s},
+                        type="number", value=1, min=1, max=9999,
+                        placeholder="1",
+                        style={**INPUT_STYLE, "width": "45px", "fontSize": "11px"},
+                        debounce=True,
+                    ),
+                ]
+            ]),
             # Time controls
             html.Div(style={
                 "display": "flex", "alignItems": "center", "gap": "8px",
@@ -1014,6 +1038,10 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "lock-scale", "chart": _ci, "series": s}, "value")
         for s in range(1, NUM_SERIES + 1)
     ]
+    _filter_inputs = [
+        Input({"type": "filter-window", "chart": _ci, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
 
     @app.callback(
         Output({"type": "graph", "index": _ci}, "figure"),
@@ -1023,6 +1051,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         *_series_inputs,
         *_own_scale_inputs,
         *_lock_scale_inputs,
+        *_filter_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
         Input({"type": "win-min", "index": _ci}, "value"),
@@ -1041,7 +1070,8 @@ for _ci in range(1, MAX_CHARTS + 1):
         own_flags = [("own" in (v or [])) for v in own_checklists]
         lock_checklists = list(args[NUM_SERIES * 2:NUM_SERIES * 3])
         lock_flags = [("lock" in (v or [])) for v in lock_checklists]
-        rest = args[NUM_SERIES * 3:]
+        filter_windows = list(args[NUM_SERIES * 3:NUM_SERIES * 4])
+        rest = args[NUM_SERIES * 4:]
         goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = rest
 
         # Issue #4: Read from per-session store instead of global state
@@ -1089,7 +1119,23 @@ for _ci in range(1, MAX_CHARTS + 1):
             start_time = max(data_start, end_time - timedelta(minutes=w_min))
 
         mask = (df["Time"] >= start_time) & (df["Time"] <= end_time)
-        df_slice = df.loc[mask]
+        df_slice = df.loc[mask].copy()
+
+        # Apply rolling mean filter per series (Issue #18)
+        for idx, tag_code in enumerate(tags):
+            if not tag_code or tag_code not in df_slice.columns:
+                continue
+            fw = filter_windows[idx]
+            try:
+                fw = int(fw) if fw else 1
+            except (ValueError, TypeError):
+                fw = 1
+            if fw > 1:
+                df_slice[tag_code] = (
+                    df_slice[tag_code]
+                    .rolling(window=fw, min_periods=1, center=True)
+                    .mean()
+                )
 
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
@@ -1626,6 +1672,8 @@ for _c in range(1, MAX_CHARTS + 1):
         _save_states.append(State({"type": "own-scale", "chart": _c, "series": _s}, "value"))
     for _s in range(1, NUM_SERIES + 1):
         _save_states.append(State({"type": "lock-scale", "chart": _c, "series": _s}, "value"))
+    for _s in range(1, NUM_SERIES + 1):
+        _save_states.append(State({"type": "filter-window", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
 
@@ -1653,20 +1701,22 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, *cha
     if saved is None:
         saved = {}
 
-    # Parse chart_args: series + own-scale + lock-scale + width + height per chart
-    per_chart = NUM_SERIES * 3 + 2
+    # Parse chart_args: series + own-scale + lock-scale + filter-window + width + height per chart
+    per_chart = NUM_SERIES * 4 + 2
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
         series_vals = list(chart_args[offset:offset + NUM_SERIES])
         own_vals = list(chart_args[offset + NUM_SERIES:offset + NUM_SERIES * 2])
         lock_vals = list(chart_args[offset + NUM_SERIES * 2:offset + NUM_SERIES * 3])
-        width_val = chart_args[offset + NUM_SERIES * 3]
-        height_val = chart_args[offset + NUM_SERIES * 3 + 1]
+        filter_vals = list(chart_args[offset + NUM_SERIES * 3:offset + NUM_SERIES * 4])
+        width_val = chart_args[offset + NUM_SERIES * 4]
+        height_val = chart_args[offset + NUM_SERIES * 4 + 1]
         charts_config[str(c + 1)] = {
             "series": series_vals,
             "own_scale": own_vals,
             "lock_scale": lock_vals,
+            "filter_window": filter_vals,
             "width": width_val,
             "height": height_val,
         }
@@ -1726,6 +1776,10 @@ for _c in range(1, MAX_CHARTS + 1):
         _load_setup_outputs.append(
             Output({"type": "lock-scale", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "filter-window", "chart": _c, "series": _s}, "value", allow_duplicate=True)
+        )
     _load_setup_outputs.append(
         Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
     )
@@ -1769,6 +1823,12 @@ def load_setup(selected_name, saved):
             lock_vals.append([])
         for lv in lock_vals[:NUM_SERIES]:
             results.append(lv if lv else [])
+        # Restore filter window values (backward-compatible: default to 1 if missing)
+        filter_vals = chart_cfg.get("filter_window", [1] * NUM_SERIES)
+        while len(filter_vals) < NUM_SERIES:
+            filter_vals.append(1)
+        for fv in filter_vals[:NUM_SERIES]:
+            results.append(fv if fv else 1)
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", "300"))
 
