@@ -293,8 +293,13 @@ def make_chart_panel(chart_id):
                             style=BTN_STYLE, title="Scroll left"),
                 html.Button("\u25B6", id={"type": "scroll-right", "index": chart_id},
                             style=BTN_STYLE, title="Scroll right"),
+                html.Button("Load Area", id={"type": "load-area-btn", "index": chart_id},
+                            style={**BTN_STYLE, "color": "#f0883e",
+                                   "marginLeft": "12px"},
+                            title="Load data for the visible area after zooming out"),
             ]),
             dcc.Store(id={"type": "start-time", "index": chart_id}, data=None),
+            dcc.Store(id={"type": "x-range", "index": chart_id}, data=None),
         ],
     )
 
@@ -1113,6 +1118,7 @@ for _di in range(1, MAX_CHARTS + 1):
         Output({"type": "step", "index": _di}, "disabled"),
         Output({"type": "scroll-left", "index": _di}, "disabled"),
         Output({"type": "scroll-right", "index": _di}, "disabled"),
+        Output({"type": "load-area-btn", "index": _di}, "disabled"),
         Input("sync-state", "data"),
         prevent_initial_call=True,
     )
@@ -1120,12 +1126,12 @@ for _di in range(1, MAX_CHARTS + 1):
         if sync_state and sync_state.get("active"):
             if sync_state.get("master") == _cid:
                 # Master: controls remain enabled
-                return False, False, False, False, False, False, False
+                return False, False, False, False, False, False, False, False
             else:
                 # Locked: disable all time controls
-                return True, True, True, True, True, True, True
+                return True, True, True, True, True, True, True, True
         # Not synced: all enabled
-        return False, False, False, False, False, False, False
+        return False, False, False, False, False, False, False, False
 
     toggle_controls.__name__ = f"toggle_controls_{_di}"
 
@@ -1566,6 +1572,71 @@ def delete_setup(n_clicks, selected_name, saved):
 
     del saved[selected_name]
     return saved, f"Deleted \"{selected_name}\".", None
+
+
+# ---------------------------------------------------------------------------
+# X-range tracking: store visible x-axis range when user zooms/pans
+# ---------------------------------------------------------------------------
+
+for _xi in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "x-range", "index": _xi}, "data"),
+        Input({"type": "graph", "index": _xi}, "relayoutData"),
+        prevent_initial_call=True,
+    )
+    def track_x_range(relayout_data, _cid=_xi):
+        if not relayout_data:
+            return no_update
+        x0 = relayout_data.get("xaxis.range[0]")
+        x1 = relayout_data.get("xaxis.range[1]")
+        if x0 is None or x1 is None:
+            return no_update
+        return {"x0": str(x0), "x1": str(x1)}
+
+    track_x_range.__name__ = f"track_x_range_{_xi}"
+
+
+# ---------------------------------------------------------------------------
+# Load Area button: read stored x-range and update time controls
+# ---------------------------------------------------------------------------
+
+for _li in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "start-time", "index": _li}, "data", allow_duplicate=True),
+        Output({"type": "goto-date", "index": _li}, "value", allow_duplicate=True),
+        Output({"type": "goto-time", "index": _li}, "value", allow_duplicate=True),
+        Output({"type": "win-min", "index": _li}, "value", allow_duplicate=True),
+        Output({"type": "win-hr", "index": _li}, "value", allow_duplicate=True),
+        Input({"type": "load-area-btn", "index": _li}, "n_clicks"),
+        State({"type": "x-range", "index": _li}, "data"),
+        prevent_initial_call=True,
+    )
+    def load_area(n_clicks, x_range_data, _cid=_li):
+        if not n_clicks or not x_range_data:
+            return no_update, no_update, no_update, no_update, no_update
+        x0 = x_range_data.get("x0")
+        x1 = x_range_data.get("x1")
+        if not x0 or not x1:
+            return no_update, no_update, no_update, no_update, no_update
+        try:
+            t0 = pd.Timestamp(x0)
+            t1 = pd.Timestamp(x1)
+        except Exception:
+            return no_update, no_update, no_update, no_update, no_update
+        if t1 <= t0:
+            return no_update, no_update, no_update, no_update, no_update
+        delta = t1 - t0
+        total_minutes = delta.total_seconds() / 60.0
+        win_hr = int(total_minutes // 60)
+        win_min = round(total_minutes - win_hr * 60)
+        if win_hr == 0 and win_min == 0:
+            win_min = 1
+        start_iso = t0.isoformat()
+        date_str = t0.strftime("%Y-%m-%d")
+        time_str = t0.strftime("%H:%M")
+        return start_iso, date_str, time_str, win_min, win_hr
+
+    load_area.__name__ = f"load_area_{_li}"
 
 
 # ---------------------------------------------------------------------------
