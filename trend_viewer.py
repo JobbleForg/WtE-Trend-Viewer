@@ -44,6 +44,40 @@ def _cleanup_temp_files():
 atexit.register(_cleanup_temp_files)
 
 
+# ---------------------------------------------------------------------------
+# Persistent tag-manager data (survives reboots / updates)
+# ---------------------------------------------------------------------------
+
+_TAG_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "tag_manager_data.json")
+
+
+def _load_tag_manager_data():
+    """Load saved tag nicknames and custom units from the local JSON file."""
+    if os.path.isfile(_TAG_DATA_FILE):
+        try:
+            with open(_TAG_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("nicknames", {}), data.get("custom_units", [])
+        except (json.JSONDecodeError, OSError):
+            return {}, []
+    return {}, []
+
+
+def _save_tag_manager_data(nicknames, custom_units):
+    """Write tag nicknames and custom units to the local JSON file."""
+    payload = {"nicknames": nicknames or {}, "custom_units": custom_units or []}
+    try:
+        with open(_TAG_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+# Pre-load persisted data so stores can be initialised with it
+_INIT_NICKNAMES, _INIT_CUSTOM_UNITS = _load_tag_manager_data()
+
+
 def _num_or_none(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
@@ -175,12 +209,18 @@ WIDTH_OPTIONS = [
     {"label": "Half", "value": "half"},
     {"label": "Full", "value": "full"},
 ]
-HEIGHT_OPTIONS = [
-    {"label": "Small",  "value": "200"},
-    {"label": "Medium", "value": "300"},
-    {"label": "Large",  "value": "450"},
-    {"label": "XL",     "value": "600"},
-]
+DEFAULT_HEIGHT_PX = 300
+
+LOCKED_ICON_STYLE = {
+    "fontSize": "11px", "cursor": "pointer",
+    "color": "#3fb950", "lineHeight": "1",
+    "userSelect": "none", "textAlign": "center",
+}
+UNLOCKED_ICON_STYLE = {
+    "fontSize": "11px", "cursor": "pointer",
+    "color": MUTED_TEXT, "lineHeight": "1",
+    "userSelect": "none", "textAlign": "center",
+}
 
 # ---------------------------------------------------------------------------
 # Dash app
@@ -200,18 +240,39 @@ def make_chart_panel(chart_id):
         row_children = []
         for s in range(row_start, min(row_start + 5, NUM_SERIES + 1)):
             color_dot = TRACE_COLORS[s - 1]
+            # Each series: label + vertical stack (lock on top, dropdown below) + Own checkbox
             row_children.extend([
                 html.Span(f"S{s}", style={
                     **LABEL_STYLE,
                     "color": color_dot, "fontWeight": "bold",
                     "marginLeft": "8px" if s != row_start else "0",
                 }),
-                dcc.Dropdown(
-                    id={"type": "series-dd", "chart": chart_id, "series": s},
-                    options=[], value=None,
-                    placeholder=f"Series {s}", clearable=True,
-                    style={**DROPDOWN_STYLE, "width": "150px"},
-                    className="dark-dropdown",
+                html.Div(style={
+                    "display": "flex", "flexDirection": "column",
+                    "alignItems": "center", "gap": "0px",
+                }, children=[
+                    html.Div(
+                        id={"type": "lock-scale-btn", "chart": chart_id, "series": s},
+                        children="\U0001F513",
+                        n_clicks=0,
+                        style=UNLOCKED_ICON_STYLE,
+                        title="Lock Y-axis scale",
+                    ),
+                    dcc.Dropdown(
+                        id={"type": "series-dd", "chart": chart_id, "series": s},
+                        options=[], value=None,
+                        placeholder=f"Series {s}", clearable=True,
+                        style={**DROPDOWN_STYLE, "width": "150px"},
+                        className="dark-dropdown",
+                    ),
+                ]),
+                # Hidden store to hold the lock state (toggled by the button callback)
+                dcc.Checklist(
+                    id={"type": "lock-scale", "chart": chart_id, "series": s},
+                    options=[{"label": "", "value": "lock"}],
+                    value=[],
+                    style={"display": "none"},
+                    inline=True,
                 ),
                 dcc.Checklist(
                     id={"type": "own-scale", "chart": chart_id, "series": s},
@@ -220,16 +281,6 @@ def make_chart_panel(chart_id):
                     style={"fontSize": "10px", "color": MUTED_TEXT,
                            "display": "inline-flex", "alignItems": "center"},
                     className="own-scale-check",
-                    inline=True,
-                ),
-                dcc.Checklist(
-                    id={"type": "lock-scale", "chart": chart_id, "series": s},
-                    options=[{"label": "\U0001F512", "value": "lock"}],
-                    value=[],
-                    style={"fontSize": "10px", "color": MUTED_TEXT,
-                           "display": "inline-flex", "alignItems": "center",
-                           "marginRight": "2px"},
-                    className="lock-scale-check",
                     inline=True,
                 ),
             ])
@@ -267,12 +318,34 @@ def make_chart_panel(chart_id):
                     className="dark-dropdown",
                 ),
                 html.Span("H:", style={**LABEL_STYLE, "fontSize": "11px"}),
-                dcc.Dropdown(
+                dcc.Input(
                     id={"type": "height-select", "index": chart_id},
-                    options=HEIGHT_OPTIONS, value="300", clearable=False,
-                    style={**DROPDOWN_STYLE, "width": "90px", "fontSize": "11px"},
-                    className="dark-dropdown",
+                    type="number", value=DEFAULT_HEIGHT_PX,
+                    min=100, max=2000, step=50,
+                    style={**INPUT_STYLE, "width": "60px", "fontSize": "11px"},
+                    debounce=True,
                 ),
+                html.Span("px", style={**LABEL_STYLE, "fontSize": "10px",
+                                        "color": MUTED_TEXT}),
+                dcc.Checklist(
+                    id={"type": "show-limits", "index": chart_id},
+                    options=[{"label": "Limits", "value": "limits"}],
+                    value=["limits"],
+                    style={"fontSize": "10px", "color": MUTED_TEXT,
+                           "display": "inline-flex", "alignItems": "center"},
+                    className="own-scale-check",
+                    inline=True,
+                ),
+                html.Button("\u2398 Copy CSV",
+                            id={"type": "copy-csv-btn", "index": chart_id},
+                            style={**BTN_STYLE, "color": "#d29922",
+                                   "fontSize": "11px", "padding": "2px 10px"},
+                            title="Copy visible data as CSV to clipboard"),
+                html.Button("\U0001F513 Lock All",
+                            id={"type": "lock-all-btn", "index": chart_id},
+                            style={**BTN_STYLE, "color": MUTED_TEXT,
+                                   "fontSize": "11px", "padding": "2px 10px"},
+                            title="Lock / unlock all Y-axis scales on this chart"),
                 html.Button("\U0001F517 Sync", id={"type": "sync-btn", "index": chart_id},
                             style={**BTN_STYLE, "color": "#58a6ff",
                                    "fontSize": "11px", "padding": "2px 10px"},
@@ -286,67 +359,124 @@ def make_chart_panel(chart_id):
             dcc.Graph(
                 id={"type": "graph", "index": chart_id},
                 config={"displayModeBar": True, "scrollZoom": True},
-                style={"height": "300px"},
+                style={"height": f"{DEFAULT_HEIGHT_PX}px"},
             ),
-            *dropdown_rows,
-            # Filter row for rolling mean (Issue #18)
-            html.Div(style={
-                "display": "flex", "alignItems": "center", "gap": "4px",
-                "marginTop": "4px", "flexWrap": "wrap",
-            }, children=[
-                html.Span("Filter:", style={
-                    **LABEL_STYLE, "fontSize": "11px", "color": MUTED_TEXT,
-                }),
-            ] + [
-                item for s in range(1, NUM_SERIES + 1) for item in [
-                    html.Span(f"S{s}", style={
-                        "color": TRACE_COLORS[s - 1], "fontSize": "10px",
-                        "fontWeight": "bold",
-                        "marginLeft": "6px" if s > 1 else "0",
-                    }),
-                    dcc.Input(
-                        id={"type": "filter-window", "chart": chart_id, "series": s},
-                        type="number", value=1, min=1, max=9999,
-                        placeholder="1",
-                        style={**INPUT_STYLE, "width": "45px", "fontSize": "11px"},
-                        debounce=True,
-                    ),
-                ]
+            # Collapsible setup area toggle
+            html.Div(style={"textAlign": "center", "marginTop": "2px"}, children=[
+                html.Button(
+                    "Setup \u25BC",
+                    id={"type": "setup-toggle", "index": chart_id},
+                    style={**BTN_STYLE, "fontSize": "10px", "padding": "1px 12px",
+                           "color": MUTED_TEXT, "width": "100%"},
+                    title="Show / hide chart setup controls",
+                ),
             ]),
-            # Time controls
-            html.Div(style={
-                "display": "flex", "alignItems": "center", "gap": "8px",
-                "marginTop": "6px", "flexWrap": "wrap",
-            }, children=[
-                html.Span("Go to:", style=LABEL_STYLE),
-                dcc.Input(id={"type": "goto-date", "index": chart_id}, type="text",
-                          value="", placeholder="YYYY-MM-DD",
-                          style={**INPUT_STYLE, "width": "100px"}, debounce=True),
-                dcc.Input(id={"type": "goto-time", "index": chart_id}, type="text",
-                          value="00:00", placeholder="HH:MM",
-                          style={**INPUT_STYLE, "width": "60px"}, debounce=True),
-                html.Span("Window:", style={**LABEL_STYLE, "marginLeft": "12px"}),
-                dcc.Input(id={"type": "win-min", "index": chart_id}, type="number",
-                          value=60, style={**INPUT_STYLE, "width": "55px"}, debounce=True),
-                html.Span("min +", style=LABEL_STYLE),
-                dcc.Input(id={"type": "win-hr", "index": chart_id}, type="number",
-                          value=0, style={**INPUT_STYLE, "width": "45px"}, debounce=True),
-                html.Span("hr", style=LABEL_STYLE),
-                html.Span("Step:", style={**LABEL_STYLE, "marginLeft": "12px"}),
-                dcc.Input(id={"type": "step", "index": chart_id}, type="number",
-                          value=15, style={**INPUT_STYLE, "width": "55px"}, debounce=True),
-                html.Span("min", style=LABEL_STYLE),
-                html.Button("\u25C0", id={"type": "scroll-left", "index": chart_id},
-                            style=BTN_STYLE, title="Scroll left"),
-                html.Button("\u25B6", id={"type": "scroll-right", "index": chart_id},
-                            style=BTN_STYLE, title="Scroll right"),
-                html.Button("Load Area", id={"type": "load-area-btn", "index": chart_id},
-                            style={**BTN_STYLE, "color": "#f0883e",
-                                   "marginLeft": "12px"},
-                            title="Load data for the visible area after zooming out"),
-            ]),
+            # Collapsible setup area (Issue #15)
+            html.Div(
+                id={"type": "setup-area", "index": chart_id},
+                style={"display": "block"},
+                children=[
+                    *dropdown_rows,
+                    # Filter row for rolling mean (Issue #18)
+                    html.Div(style={
+                        "display": "flex", "alignItems": "center", "gap": "4px",
+                        "marginTop": "4px", "flexWrap": "wrap",
+                    }, children=[
+                        html.Span("Filter:", style={
+                            **LABEL_STYLE, "fontSize": "11px", "color": MUTED_TEXT,
+                        }),
+                    ] + [
+                        item for s in range(1, NUM_SERIES + 1) for item in [
+                            html.Span(f"S{s}", style={
+                                "color": TRACE_COLORS[s - 1], "fontSize": "10px",
+                                "fontWeight": "bold",
+                                "marginLeft": "6px" if s > 1 else "0",
+                            }),
+                            dcc.Input(
+                                id={"type": "filter-window", "chart": chart_id, "series": s},
+                                type="number", value=1, min=1, max=9999,
+                                placeholder="1",
+                                style={**INPUT_STYLE, "width": "45px", "fontSize": "11px"},
+                                debounce=True,
+                            ),
+                        ]
+                    ]),
+                    # Time controls
+                    html.Div(style={
+                        "display": "flex", "alignItems": "center", "gap": "8px",
+                        "marginTop": "6px", "flexWrap": "wrap",
+                    }, children=[
+                        html.Span("Go to:", style=LABEL_STYLE),
+                        dcc.Input(id={"type": "goto-date", "index": chart_id}, type="text",
+                                  value="", placeholder="YYYY-MM-DD",
+                                  style={**INPUT_STYLE, "width": "100px"}, debounce=True),
+                        dcc.Input(id={"type": "goto-time", "index": chart_id}, type="text",
+                                  value="00:00", placeholder="HH:MM",
+                                  style={**INPUT_STYLE, "width": "60px"}, debounce=True),
+                        html.Span("Window:", style={**LABEL_STYLE, "marginLeft": "12px"}),
+                        dcc.Input(id={"type": "win-min", "index": chart_id}, type="number",
+                                  value=60, style={**INPUT_STYLE, "width": "55px"}, debounce=True),
+                        html.Span("min +", style=LABEL_STYLE),
+                        dcc.Input(id={"type": "win-hr", "index": chart_id}, type="number",
+                                  value=0, style={**INPUT_STYLE, "width": "45px"}, debounce=True),
+                        html.Span("hr", style=LABEL_STYLE),
+                        html.Span("Step:", style={**LABEL_STYLE, "marginLeft": "12px"}),
+                        dcc.Input(id={"type": "step", "index": chart_id}, type="number",
+                                  value=15, style={**INPUT_STYLE, "width": "55px"}, debounce=True),
+                        html.Span("min", style=LABEL_STYLE),
+                        html.Button("\u25C0", id={"type": "scroll-left", "index": chart_id},
+                                    style=BTN_STYLE, title="Scroll left"),
+                        html.Button("\u25B6", id={"type": "scroll-right", "index": chart_id},
+                                    style=BTN_STYLE, title="Scroll right"),
+                        html.Button("Load Area", id={"type": "load-area-btn", "index": chart_id},
+                                    style={**BTN_STYLE, "color": "#f0883e",
+                                           "marginLeft": "12px"},
+                                    title="Load data for the visible area after zooming out"),
+                        html.Button("Autoscale X", id={"type": "autoscale-x-btn", "index": chart_id},
+                                    style={**BTN_STYLE, "color": "#3fb950",
+                                           "marginLeft": "4px"},
+                                    title="Reset X-axis to full data range (keeps Y-axes)"),
+                    ]),
+                ],
+            ),
             dcc.Store(id={"type": "start-time", "index": chart_id}, data=None),
             dcc.Store(id={"type": "x-range", "index": chart_id}, data=None),
+            dcc.Store(id={"type": "lock-all-state", "index": chart_id}, data=False),
+            dcc.Store(id={"type": "csv-data", "index": chart_id}, data=""),
+            html.Span(id={"type": "csv-clipboard-dummy", "index": chart_id},
+                       style={"display": "none"}),
+            dcc.Store(id={"type": "cursor-ts", "index": chart_id}, data=None),
+            html.Div(
+                id={"type": "cursor-readout", "index": chart_id},
+                style={"display": "none"},
+                children=[
+                    html.Div(style={
+                        "display": "flex", "alignItems": "center",
+                        "backgroundColor": "#1c2129",
+                        "border": f"1px solid {BORDER_COLOR}",
+                        "borderRadius": "4px",
+                        "padding": "4px 8px", "marginTop": "2px",
+                    }, children=[
+                        html.Span(
+                            id={"type": "cursor-readout-text", "index": chart_id},
+                            style={
+                                "fontSize": "11px",
+                                "fontFamily": "Consolas, monospace",
+                                "color": TEXT_COLOR, "flex": "1",
+                            },
+                        ),
+                        html.Button(
+                            "\u2715 Clear",
+                            id={"type": "cursor-clear-btn", "index": chart_id},
+                            style={
+                                **BTN_STYLE, "color": "#f85149",
+                                "fontSize": "10px", "padding": "1px 8px",
+                                "marginLeft": "8px", "flexShrink": "0",
+                            },
+                        ),
+                    ]),
+                ],
+            ),
         ],
     )
 
@@ -362,8 +492,61 @@ app.layout = html.Div(style={
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
-    dcc.Store(id="tag-nicknames", storage_type="session", data={}),
-    dcc.Store(id="custom-units", storage_type="session", data=[]),
+    dcc.Store(id="tag-nicknames", storage_type="memory", data=_INIT_NICKNAMES),
+    dcc.Store(id="custom-units", storage_type="memory", data=_INIT_CUSTOM_UNITS),
+    dcc.Store(id="notes-text", storage_type="local", data=""),
+
+    # Notes overlay panel (Issue #12)
+    html.Div(
+        id="notes-overlay",
+        style={
+            "display": "none",
+            "position": "fixed", "top": "50%", "left": "50%",
+            "transform": "translate(-50%, -50%)",
+            "zIndex": 9999,
+            "width": "500px", "maxWidth": "90vw",
+            "backgroundColor": PANEL_BG,
+            "border": f"2px solid {ACCENT}",
+            "borderRadius": "10px",
+            "boxShadow": "0 8px 32px rgba(0,0,0,0.6)",
+            "padding": "0",
+            "flexDirection": "column",
+        },
+        children=[
+            # Title bar
+            html.Div(style={
+                "display": "flex", "alignItems": "center",
+                "padding": "8px 12px",
+                "borderBottom": f"1px solid {BORDER_COLOR}",
+                "borderRadius": "10px 10px 0 0",
+                "backgroundColor": "#1c2129",
+            }, children=[
+                html.Span("\U0001F4DD Notes", style={
+                    "color": TEXT_COLOR, "fontSize": "14px",
+                    "fontWeight": "bold", "flex": "1",
+                }),
+                html.Button("\u2715", id="notes-close-btn", style={
+                    **BTN_STYLE, "color": "#f85149", "fontSize": "14px",
+                    "padding": "2px 8px",
+                }),
+            ]),
+            # Textarea
+            dcc.Textarea(
+                id="notes-textarea",
+                value="",
+                placeholder="Jot down observations, timestamps, suspected causes...",
+                style={
+                    "width": "100%", "minHeight": "250px",
+                    "backgroundColor": "#0d1117",
+                    "color": TEXT_COLOR, "border": "none",
+                    "padding": "12px", "fontSize": "12px",
+                    "fontFamily": "Consolas, monospace",
+                    "resize": "vertical", "boxSizing": "border-box",
+                    "borderRadius": "0 0 10px 10px",
+                },
+            ),
+        ],
+    ),
 
     # Header toolbar
     html.Div(style={
@@ -432,6 +615,10 @@ app.layout = html.Div(style={
         ]),
         html.Span(id="setup-status-msg", children="",
                   style={"color": MUTED_TEXT, "fontSize": "11px"}),
+        html.Button("\U0001F4DD Notes", id="notes-toggle-btn", style={
+            **BTN_STYLE, "marginLeft": "12px", "padding": "6px 14px",
+            "fontSize": "13px", "color": "#d2a8ff",
+        }, title="Open / close notes panel"),
     ]),
 
     # Data stats bar
@@ -595,17 +782,6 @@ app.index_string = '''<!DOCTYPE html>
         .own-scale-check input[type="checkbox"] {
             margin-right: 2px;
         }
-        /* Lock-scale checkbox styling */
-        .lock-scale-check label {
-            color: ''' + MUTED_TEXT + ''' !important;
-            font-size: 10px !important;
-            cursor: pointer;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-        .lock-scale-check input[type="checkbox"] {
-            margin-right: 1px;
-        }
     </style>
 </head>
 <body>
@@ -623,7 +799,7 @@ app.index_string = '''<!DOCTYPE html>
 # ---------------------------------------------------------------------------
 
 @app.callback(
-    Output("visible-charts", "data"),
+    Output("visible-charts", "data", allow_duplicate=True),
     Output("sync-state", "data", allow_duplicate=True),
     Input("add-chart-btn", "n_clicks"),
     Input({"type": "close-btn", "index": ALL}, "n_clicks"),
@@ -667,10 +843,11 @@ def update_visible_charts(add_clicks, close_clicks_list, visible, sync_state):
 
 for _i in range(1, MAX_CHARTS + 1):
     @app.callback(
-        Output({"type": "chart-wrapper", "index": _i}, "style"),
+        Output({"type": "chart-wrapper", "index": _i}, "style", allow_duplicate=True),
         Input("visible-charts", "data"),
         Input({"type": "width-select", "index": _i}, "value"),
         Input({"type": "height-select", "index": _i}, "value"),
+        prevent_initial_call=True,
     )
     def update_panel_style(visible, width_val, height_val, _cid=_i):
         is_visible = _cid in (visible or [])
@@ -695,8 +872,35 @@ for _i in range(1, MAX_CHARTS + 1):
         Input({"type": "height-select", "index": _i}, "value"),
     )
     def update_graph_height(height_val, _cid=_i):
-        h = int(height_val) if height_val else 300
+        try:
+            h = int(height_val) if height_val else DEFAULT_HEIGHT_PX
+        except (ValueError, TypeError):
+            h = DEFAULT_HEIGHT_PX
+        h = max(100, min(2000, h))
         return {"height": f"{h}px"}
+
+
+# ---------------------------------------------------------------------------
+# Callback: Toggle setup area visibility (Issue #15)
+# ---------------------------------------------------------------------------
+
+for _st in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "setup-area", "index": _st}, "style"),
+        Output({"type": "setup-toggle", "index": _st}, "children"),
+        Input({"type": "setup-toggle", "index": _st}, "n_clicks"),
+        State({"type": "setup-area", "index": _st}, "style"),
+        prevent_initial_call=True,
+    )
+    def toggle_setup_area(n_clicks, current_style, _cid=_st):
+        if not n_clicks:
+            return no_update, no_update
+        is_hidden = (current_style or {}).get("display") == "none"
+        new_style = {"display": "block" if is_hidden else "none"}
+        label = "Setup \u25BC" if is_hidden else "Setup \u25B2"
+        return new_style, label
+
+    toggle_setup_area.__name__ = f"toggle_setup_area_{_st}"
 
 
 # ---------------------------------------------------------------------------
@@ -757,10 +961,10 @@ _load_outputs = [
 ]
 for _c in range(1, MAX_CHARTS + 1):
     for _s in range(1, NUM_SERIES + 1):
-        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "options"))
-        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "value"))
-    _load_outputs.append(Output({"type": "start-time", "index": _c}, "data"))
-    _load_outputs.append(Output({"type": "goto-date", "index": _c}, "value"))
+        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "options", allow_duplicate=True))
+        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "value", allow_duplicate=True))
+    _load_outputs.append(Output({"type": "start-time", "index": _c}, "data", allow_duplicate=True))
+    _load_outputs.append(Output({"type": "goto-date", "index": _c}, "value", allow_duplicate=True))
 
 
 @app.callback(
@@ -836,8 +1040,33 @@ def on_sheet_selected(sheet_name, temp_path):
 # Figure builder
 # ---------------------------------------------------------------------------
 
+
+def _interpolate_at(df, column, timestamp):
+    """Linearly interpolate a column value at the given timestamp."""
+    if column not in df.columns or "Time" not in df.columns:
+        return None
+    sub = df[["Time", column]].dropna(subset=[column])
+    if sub.empty:
+        return None
+    times = sub["Time"]
+    ts = pd.Timestamp(timestamp)
+    if ts <= times.iloc[0]:
+        return float(sub[column].iloc[0])
+    if ts >= times.iloc[-1]:
+        return float(sub[column].iloc[-1])
+    idx_after = times.searchsorted(ts)
+    idx_before = idx_after - 1
+    t0, t1 = times.iloc[idx_before], times.iloc[idx_after]
+    v0, v1 = float(sub[column].iloc[idx_before]), float(sub[column].iloc[idx_after])
+    if t1 == t0:
+        return v0
+    frac = (ts - t0).total_seconds() / (t1 - t0).total_seconds()
+    return v0 + frac * (v1 - v0)
+
+
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
-                   nicknames=None, own_scale_flags=None, lock_scale_flags=None):
+                   nicknames=None, own_scale_flags=None, lock_scale_flags=None,
+                   show_limits=False, cursor_ts=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
     up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
@@ -975,6 +1204,56 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             line=dict(color=color, width=1.5), mode="lines",
         ))
 
+    # --- Step 4b: Add threshold limit lines (Issue #11) --------------------
+    limit_shapes = []
+    limit_annotations = []
+    if show_limits:
+        for (idx, tag_code, display_name, display_unit, color, info) in active_series:
+            y_high = info.get("y_high")
+            y_low = info.get("y_low")
+            if y_high is None and y_low is None:
+                continue
+            is_own = own_scale_flags[idx] if idx < len(own_scale_flags) else False
+            if is_own or not display_unit:
+                unit_key = f"_own_{tag_code}"
+            else:
+                unit_key = display_unit
+            axis_num = unit_to_axis[unit_key]
+            yref = "y" if axis_num == 1 else f"y{axis_num}"
+
+            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+            line_color = f"rgba({r},{g},{b},0.45)"
+
+            for val, label_suffix in [(y_high, "Hi"), (y_low, "Lo")]:
+                if val is None:
+                    continue
+                limit_shapes.append(dict(
+                    type="line", xref="paper", x0=0, x1=1,
+                    yref=yref, y0=val, y1=val,
+                    line=dict(color=line_color, width=1.2, dash="dash"),
+                    layer="above",
+                ))
+                limit_annotations.append(dict(
+                    text=f"S{idx+1} {label_suffix}: {val}",
+                    xref="paper", x=1.0, yref=yref, y=val,
+                    xanchor="left", showarrow=False,
+                    font=dict(size=9, color=line_color),
+                    bgcolor="rgba(13,17,23,0.7)",
+                ))
+
+    # --- Step 4c: Add cursor vertical line (Issue #9) ----------------------
+    if cursor_ts:
+        try:
+            ct = pd.Timestamp(cursor_ts)
+            limit_shapes.append(dict(
+                type="line", yref="paper", y0=0, y1=1,
+                xref="x", x0=ct, x1=ct,
+                line=dict(color="#d2a8ff", width=1.5, dash="dashdot"),
+                layer="above",
+            ))
+        except Exception:
+            pass
+
     # --- Step 5: Build Y-axis layout dicts ---------------------------------
     max_left = max((a["offset"] for a in active_axes if a["side"] == "left"), default=0)
     max_right = max((a["offset"] for a in active_axes if a["side"] == "right"), default=0)
@@ -1016,6 +1295,8 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
                    uirevision=x_revision),
         uirevision="keep",
         hovermode="x unified",
+        shapes=limit_shapes,
+        annotations=limit_annotations,
         **yaxis_layouts,
     )
     return fig
@@ -1060,6 +1341,8 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "scroll-left", "index": _ci}, "n_clicks"),
         Input({"type": "scroll-right", "index": _ci}, "n_clicks"),
         Input("tag-nicknames", "data"),
+        Input({"type": "show-limits", "index": _ci}, "value"),
+        Input({"type": "cursor-ts", "index": _ci}, "data"),
         State({"type": "start-time", "index": _ci}, "data"),
         State("session-data", "data"),
         prevent_initial_call=True,
@@ -1072,7 +1355,8 @@ for _ci in range(1, MAX_CHARTS + 1):
         lock_flags = [("lock" in (v or [])) for v in lock_checklists]
         filter_windows = list(args[NUM_SERIES * 3:NUM_SERIES * 4])
         rest = args[NUM_SERIES * 4:]
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, start_time_iso, session_data = rest
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, show_limits_val, cursor_ts_val, start_time_iso, session_data = rest
+        show_limits = "limits" in (show_limits_val or [])
 
         # Issue #4: Read from per-session store instead of global state
         if not session_data:
@@ -1141,7 +1425,9 @@ for _ci in range(1, MAX_CHARTS + 1):
                             x_revision=start_time.isoformat(),
                             nicknames=nn_data or {},
                             own_scale_flags=own_flags,
-                            lock_scale_flags=lock_flags)
+                            lock_scale_flags=lock_flags,
+                            show_limits=show_limits,
+                            cursor_ts=cursor_ts_val)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -1153,7 +1439,7 @@ for _ci in range(1, MAX_CHARTS + 1):
 
 # --- Toggle sync state when any sync button is clicked ---
 @app.callback(
-    Output("sync-state", "data"),
+    Output("sync-state", "data", allow_duplicate=True),
     [Input({"type": "sync-btn", "index": i}, "n_clicks") for i in range(1, MAX_CHARTS + 1)],
     State("sync-state", "data"),
     prevent_initial_call=True,
@@ -1260,14 +1546,7 @@ for _vi in range(1, MAX_CHARTS + 1):
             basis = "calc(50% - 5px)"
         is_master = (sync_state and sync_state.get("active")
                      and sync_state.get("master") == _cid)
-        is_locked = (sync_state and sync_state.get("active")
-                     and sync_state.get("master") != _cid)
-        if is_master:
-            border = "2px solid #00e5ff"
-        elif is_locked:
-            border = f"1px solid {BORDER_COLOR}"
-        else:
-            border = f"1px solid {BORDER_COLOR}"
+        border = "2px solid #00e5ff" if is_master else f"1px solid {BORDER_COLOR}"
         return {
             "backgroundColor": PANEL_BG, "borderRadius": "8px",
             "border": border, "padding": "8px",
@@ -1464,6 +1743,46 @@ def toggle_tag_panel(n_clicks, current_style):
 
 
 # ---------------------------------------------------------------------------
+# Notes overlay: toggle, load, and save (Issue #12)
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("notes-overlay", "style"),
+    Input("notes-toggle-btn", "n_clicks"),
+    Input("notes-close-btn", "n_clicks"),
+    State("notes-overlay", "style"),
+    prevent_initial_call=True,
+)
+def toggle_notes(toggle_clicks, close_clicks, current_style):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    is_hidden = (current_style or {}).get("display") == "none"
+    if "notes-close-btn" in ctx.triggered[0]["prop_id"]:
+        return {**current_style, "display": "none"}
+    return {**current_style, "display": "flex" if is_hidden else "none"}
+
+
+@app.callback(
+    Output("notes-textarea", "value"),
+    Input("notes-text", "data"),
+)
+def load_notes(saved_text):
+    """Initialise the textarea from localStorage on page load."""
+    return saved_text or ""
+
+
+@app.callback(
+    Output("notes-text", "data"),
+    Input("notes-textarea", "value"),
+    prevent_initial_call=True,
+)
+def save_notes(text):
+    """Persist textarea content to localStorage."""
+    return text or ""
+
+
+# ---------------------------------------------------------------------------
 # Tag Manager: populate tag rows when data is loaded
 # ---------------------------------------------------------------------------
 
@@ -1497,6 +1816,11 @@ def add_custom_unit(n_clicks, new_unit, custom_units):
         # Already exists -- just clear the input
         return no_update, ""
     custom_units = custom_units + [unit]
+
+    # Persist to local JSON file
+    nicknames, _ = _load_tag_manager_data()
+    _save_tag_manager_data(nicknames, custom_units)
+
     return custom_units, ""
 
 
@@ -1589,7 +1913,7 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
     prevent_initial_call=True,
 )
 def update_tag_nicknames(nicknames, units, current_data):
-    """Persist nickname and unit edits into the session store."""
+    """Persist nickname and unit edits into the session store and JSON file."""
     ctx = callback_context
     if not ctx.triggered:
         return no_update
@@ -1614,6 +1938,10 @@ def update_tag_nicknames(nicknames, units, current_data):
         if tag_code not in current_data:
             current_data[tag_code] = {}
         current_data[tag_code]["unit"] = val or ""
+
+    # Persist to local JSON file
+    _, custom_units = _load_tag_manager_data()
+    _save_tag_manager_data(current_data, custom_units)
 
     return current_data
 
@@ -1848,6 +2176,14 @@ for _c in range(1, MAX_CHARTS + 1):
         )
     for _s in range(1, NUM_SERIES + 1):
         _load_setup_outputs.append(
+            Output({"type": "lock-scale-btn", "chart": _c, "series": _s}, "children", allow_duplicate=True)
+        )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "lock-scale-btn", "chart": _c, "series": _s}, "style", allow_duplicate=True)
+        )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
             Output({"type": "filter-window", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
     _load_setup_outputs.append(
@@ -1912,6 +2248,13 @@ def load_setup(selected_name, saved):
             lock_vals.append([])
         for lv in lock_vals[:NUM_SERIES]:
             results.append(lv if lv else [])
+        # Restore lock button icons to match lock state
+        for lv in lock_vals[:NUM_SERIES]:
+            is_lk = "lock" in (lv or [])
+            results.append("\U0001F512\u2713" if is_lk else "\U0001F513")
+        for lv in lock_vals[:NUM_SERIES]:
+            is_lk = "lock" in (lv or [])
+            results.append(LOCKED_ICON_STYLE if is_lk else UNLOCKED_ICON_STYLE)
         # Restore filter window values (backward-compatible: default to 1 if missing)
         filter_vals = chart_cfg.get("filter_window", [1] * NUM_SERIES)
         while len(filter_vals) < NUM_SERIES:
@@ -1919,7 +2262,7 @@ def load_setup(selected_name, saved):
         for fv in filter_vals[:NUM_SERIES]:
             results.append(fv if fv else 1)
         results.append(chart_cfg.get("width", "half"))
-        results.append(chart_cfg.get("height", "300"))
+        results.append(chart_cfg.get("height", DEFAULT_HEIGHT_PX))
         # Restore time settings (backward-compatible: sensible defaults)
         results.append(chart_cfg.get("start_time", None))
         results.append(chart_cfg.get("goto_date", ""))
@@ -2017,6 +2360,324 @@ for _li in range(1, MAX_CHARTS + 1):
         return start_iso, date_str, time_str, win_min, win_hr
 
     load_area.__name__ = f"load_area_{_li}"
+
+
+# ---------------------------------------------------------------------------
+# Per-series lock button toggle (click icon → flip checklist + update icon)
+# ---------------------------------------------------------------------------
+
+for _lb in range(1, MAX_CHARTS + 1):
+    for _ls in range(1, NUM_SERIES + 1):
+        @app.callback(
+            Output({"type": "lock-scale", "chart": _lb, "series": _ls}, "value", allow_duplicate=True),
+            Output({"type": "lock-scale-btn", "chart": _lb, "series": _ls}, "children", allow_duplicate=True),
+            Output({"type": "lock-scale-btn", "chart": _lb, "series": _ls}, "style", allow_duplicate=True),
+            Output({"type": "lock-all-state", "index": _lb}, "data", allow_duplicate=True),
+            Output({"type": "lock-all-btn", "index": _lb}, "children", allow_duplicate=True),
+            Output({"type": "lock-all-btn", "index": _lb}, "style", allow_duplicate=True),
+            Input({"type": "lock-scale-btn", "chart": _lb, "series": _ls}, "n_clicks"),
+            State({"type": "lock-scale", "chart": _lb, "series": _ls}, "value"),
+            prevent_initial_call=True,
+        )
+        def toggle_lock_btn(n_clicks, current_val, _c=_lb, _s=_ls):
+            if not n_clicks:
+                return no_update, no_update, no_update, no_update, no_update, no_update
+            is_locked = "lock" in (current_val or [])
+            # Reset Lock All state when individual lock changes
+            btn_reset_style = {**BTN_STYLE, "color": MUTED_TEXT,
+                               "fontSize": "11px", "padding": "2px 10px"}
+            if is_locked:
+                # Unlock
+                return [], "\U0001F513", UNLOCKED_ICON_STYLE, False, "\U0001F513 Lock All", btn_reset_style
+            else:
+                # Lock
+                return ["lock"], "\U0001F512\u2713", LOCKED_ICON_STYLE, no_update, no_update, no_update
+
+        toggle_lock_btn.__name__ = f"toggle_lock_btn_{_lb}_{_ls}"
+
+
+# ---------------------------------------------------------------------------
+# Lock All button: lock / unlock every series on a chart
+# ---------------------------------------------------------------------------
+
+for _la in range(1, MAX_CHARTS + 1):
+    _lock_all_lock_outputs = []
+    _lock_all_icon_outputs = []
+    _lock_all_style_outputs = []
+    for _s in range(1, NUM_SERIES + 1):
+        _lock_all_lock_outputs.append(
+            Output({"type": "lock-scale", "chart": _la, "series": _s}, "value", allow_duplicate=True))
+        _lock_all_icon_outputs.append(
+            Output({"type": "lock-scale-btn", "chart": _la, "series": _s}, "children", allow_duplicate=True))
+        _lock_all_style_outputs.append(
+            Output({"type": "lock-scale-btn", "chart": _la, "series": _s}, "style", allow_duplicate=True))
+    @app.callback(
+        Output({"type": "lock-all-state", "index": _la}, "data", allow_duplicate=True),
+        Output({"type": "lock-all-btn", "index": _la}, "children", allow_duplicate=True),
+        Output({"type": "lock-all-btn", "index": _la}, "style", allow_duplicate=True),
+        *_lock_all_lock_outputs,
+        *_lock_all_icon_outputs,
+        *_lock_all_style_outputs,
+        Input({"type": "lock-all-btn", "index": _la}, "n_clicks"),
+        State({"type": "lock-all-state", "index": _la}, "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_lock_all(*args, _cid=_la):
+        n_clicks = args[0]
+        is_all_locked = args[1]
+        if not n_clicks:
+            return (no_update,) * (3 + NUM_SERIES * 3)
+        if is_all_locked:
+            # Unlock all — restore to original unlocked state
+            btn_style = {**BTN_STYLE, "color": MUTED_TEXT,
+                         "fontSize": "11px", "padding": "2px 10px"}
+            return (
+                False,
+                "\U0001F513 Lock All",
+                btn_style,
+                *([[] for _ in range(NUM_SERIES)]),
+                *(["\U0001F513" for _ in range(NUM_SERIES)]),
+                *([UNLOCKED_ICON_STYLE for _ in range(NUM_SERIES)]),
+            )
+        else:
+            # Lock all
+            btn_style = {**BTN_STYLE, "color": "#3fb950",
+                         "fontSize": "11px", "padding": "2px 10px"}
+            return (
+                True,
+                "\U0001F512\u2713 Lock All",
+                btn_style,
+                *([["lock"] for _ in range(NUM_SERIES)]),
+                *(["\U0001F512\u2713" for _ in range(NUM_SERIES)]),
+                *([LOCKED_ICON_STYLE for _ in range(NUM_SERIES)]),
+            )
+
+    toggle_lock_all.__name__ = f"toggle_lock_all_{_la}"
+
+
+# ---------------------------------------------------------------------------
+# Autoscale X: reset X-axis to full data range, keeping Y-axes untouched
+# ---------------------------------------------------------------------------
+
+for _ax in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "start-time", "index": _ax}, "data", allow_duplicate=True),
+        Output({"type": "goto-date", "index": _ax}, "value", allow_duplicate=True),
+        Output({"type": "goto-time", "index": _ax}, "value", allow_duplicate=True),
+        Output({"type": "win-min", "index": _ax}, "value", allow_duplicate=True),
+        Output({"type": "win-hr", "index": _ax}, "value", allow_duplicate=True),
+        Input({"type": "autoscale-x-btn", "index": _ax}, "n_clicks"),
+        State("session-data", "data"),
+        prevent_initial_call=True,
+    )
+    def autoscale_x(n_clicks, session_data, _cid=_ax):
+        """Reset X-axis to full data range without affecting Y-axes."""
+        if not n_clicks or not session_data:
+            return no_update, no_update, no_update, no_update, no_update
+        data_start = session_data.get("data_start")
+        data_end = session_data.get("data_end")
+        if not data_start or not data_end:
+            return no_update, no_update, no_update, no_update, no_update
+        t0 = pd.Timestamp(data_start)
+        t1 = pd.Timestamp(data_end)
+        delta = t1 - t0
+        total_minutes = delta.total_seconds() / 60.0
+        win_hr = int(total_minutes // 60)
+        win_min = round(total_minutes - win_hr * 60)
+        if win_hr == 0 and win_min == 0:
+            win_min = 1
+        return (
+            t0.isoformat(),
+            t0.strftime("%Y-%m-%d"),
+            t0.strftime("%H:%M"),
+            win_min,
+            win_hr,
+        )
+
+    autoscale_x.__name__ = f"autoscale_x_{_ax}"
+
+
+# ---------------------------------------------------------------------------
+# Copy CSV: generate CSV text for visible data on button click (Issue #10)
+# ---------------------------------------------------------------------------
+
+for _csv in range(1, MAX_CHARTS + 1):
+    _csv_series_states = [
+        State({"type": "series-dd", "chart": _csv, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
+
+    @app.callback(
+        Output({"type": "csv-data", "index": _csv}, "data"),
+        Output({"type": "copy-csv-btn", "index": _csv}, "children"),
+        Input({"type": "copy-csv-btn", "index": _csv}, "n_clicks"),
+        State({"type": "start-time", "index": _csv}, "data"),
+        State({"type": "win-min", "index": _csv}, "value"),
+        State({"type": "win-hr", "index": _csv}, "value"),
+        State("session-data", "data"),
+        State("tag-nicknames", "data"),
+        *_csv_series_states,
+        prevent_initial_call=True,
+    )
+    def build_csv(n_clicks, start_time_iso, win_min, win_hr,
+                  session_data, nn_data, *series_vals, _cid=_csv):
+        if not n_clicks or not session_data:
+            return no_update, no_update
+        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
+        if "Time" in df.columns:
+            df["Time"] = pd.to_datetime(df["Time"])
+        tag_map = session_data.get("tag_map", {})
+        data_start = pd.Timestamp(session_data["data_start"])
+
+        start = pd.Timestamp(start_time_iso) if start_time_iso else data_start
+        w_min = (win_min or 0) + (win_hr or 0) * 60
+        if w_min <= 0:
+            w_min = 60
+        end = start + timedelta(minutes=w_min)
+        mask = (df["Time"] >= start) & (df["Time"] <= end)
+        df_slice = df.loc[mask]
+
+        # Collect active tags in order
+        active_tags = [t for t in series_vals if t and t in df_slice.columns]
+        if not active_tags:
+            return "", "\u2398 Copy CSV"
+
+        nn = nn_data or {}
+        # Build header: Time, then "TagCode - Name [Unit]" for each tag
+        headers = ["Time"]
+        for tc in active_tags:
+            info = tag_map.get(tc, {})
+            tag_nn = nn.get(tc, {})
+            name = tag_nn.get("nickname") or info.get("name", tc)
+            unit = tag_nn.get("unit") or info.get("units", "")
+            unit_str = f" [{unit}]" if unit else ""
+            headers.append(f"{tc} - {name}{unit_str}")
+
+        lines = [",".join(headers)]
+        for _, row in df_slice.iterrows():
+            vals = [row["Time"].strftime("%Y-%m-%d %H:%M:%S")]
+            for tc in active_tags:
+                v = row.get(tc)
+                vals.append("" if pd.isna(v) else str(v))
+            lines.append(",".join(vals))
+
+        return "\n".join(lines), "\u2713 Copied!"
+
+    build_csv.__name__ = f"build_csv_{_csv}"
+
+
+# Clientside callback: copy CSV to clipboard when csv-data store updates
+for _cc in range(1, MAX_CHARTS + 1):
+    app.clientside_callback(
+        """
+        function(csv_data) {
+            if (csv_data) {
+                navigator.clipboard.writeText(csv_data).catch(function(){});
+            }
+            return "";
+        }
+        """,
+        Output({"type": "csv-clipboard-dummy", "index": _cc}, "children"),
+        Input({"type": "csv-data", "index": _cc}, "data"),
+        prevent_initial_call=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cursor readout: click to place cursor, Clear button to dismiss (Issue #9)
+# ---------------------------------------------------------------------------
+
+for _cur in range(1, MAX_CHARTS + 1):
+    @app.callback(
+        Output({"type": "cursor-ts", "index": _cur}, "data", allow_duplicate=True),
+        Input({"type": "graph", "index": _cur}, "clickData"),
+        Input({"type": "cursor-clear-btn", "index": _cur}, "n_clicks"),
+        State({"type": "cursor-ts", "index": _cur}, "data"),
+        prevent_initial_call=True,
+    )
+    def handle_cursor_click(click_data, clear_clicks, current_cursor, _cid=_cur):
+        ctx = callback_context
+        if not ctx.triggered:
+            return no_update
+        triggered = ctx.triggered[0]["prop_id"]
+        if "cursor-clear-btn" in triggered:
+            return None
+        if click_data and "points" in click_data and click_data["points"]:
+            x_val = click_data["points"][0].get("x")
+            if x_val is not None:
+                try:
+                    return pd.Timestamp(x_val).isoformat()
+                except Exception:
+                    pass
+        return no_update
+
+    handle_cursor_click.__name__ = f"handle_cursor_click_{_cur}"
+
+
+# ---------------------------------------------------------------------------
+# Cursor readout: populate values at cursor timestamp (Issue #9)
+# ---------------------------------------------------------------------------
+
+for _ro in range(1, MAX_CHARTS + 1):
+    _ro_series_states = [
+        State({"type": "series-dd", "chart": _ro, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
+
+    @app.callback(
+        Output({"type": "cursor-readout", "index": _ro}, "style"),
+        Output({"type": "cursor-readout-text", "index": _ro}, "children"),
+        Input({"type": "cursor-ts", "index": _ro}, "data"),
+        State("session-data", "data"),
+        State("tag-nicknames", "data"),
+        *_ro_series_states,
+        prevent_initial_call=True,
+    )
+    def update_cursor_readout(cursor_ts, session_data, nn_data, *series_vals,
+                              _cid=_ro):
+        if cursor_ts is None or not session_data:
+            return {"display": "none"}, ""
+        try:
+            cursor_t = pd.Timestamp(cursor_ts)
+        except Exception:
+            return {"display": "none"}, ""
+
+        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
+        if "Time" in df.columns:
+            df["Time"] = pd.to_datetime(df["Time"])
+        tag_map = session_data.get("tag_map", {})
+        nn = nn_data or {}
+
+        parts = [html.Span(
+            f"Cursor: {cursor_t.strftime('%Y-%m-%d %H:%M:%S')}  ",
+            style={"color": "#d2a8ff", "fontWeight": "bold"},
+        )]
+        for idx, tag_code in enumerate(series_vals):
+            if not tag_code or tag_code not in df.columns:
+                continue
+            color = TRACE_COLORS[idx % len(TRACE_COLORS)]
+            info = tag_map.get(tag_code, {})
+            tag_nn = nn.get(tag_code, {})
+            name = tag_nn.get("nickname") or info.get("name", tag_code)
+            units = tag_nn.get("unit") or info.get("units", "")
+            decimals = info.get("decimals", 2)
+            value = _interpolate_at(df, tag_code, cursor_t)
+            if value is not None:
+                try:
+                    val_str = f"{value:.{int(decimals)}f}"
+                except (ValueError, TypeError):
+                    val_str = f"{value:.2f}"
+            else:
+                val_str = "N/A"
+            unit_str = f" {units}" if units else ""
+            parts.append(html.Span(
+                f"  S{idx+1} {name}: {val_str}{unit_str}",
+                style={"color": color, "fontSize": "11px"},
+            ))
+
+        return {"display": "block"}, parts
+
+    update_cursor_readout.__name__ = f"update_cursor_readout_{_ro}"
 
 
 # ---------------------------------------------------------------------------
