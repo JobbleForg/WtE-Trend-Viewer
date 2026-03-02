@@ -44,6 +44,40 @@ def _cleanup_temp_files():
 atexit.register(_cleanup_temp_files)
 
 
+# ---------------------------------------------------------------------------
+# Persistent tag-manager data (survives reboots / updates)
+# ---------------------------------------------------------------------------
+
+_TAG_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "tag_manager_data.json")
+
+
+def _load_tag_manager_data():
+    """Load saved tag nicknames and custom units from the local JSON file."""
+    if os.path.isfile(_TAG_DATA_FILE):
+        try:
+            with open(_TAG_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("nicknames", {}), data.get("custom_units", [])
+        except (json.JSONDecodeError, OSError):
+            return {}, []
+    return {}, []
+
+
+def _save_tag_manager_data(nicknames, custom_units):
+    """Write tag nicknames and custom units to the local JSON file."""
+    payload = {"nicknames": nicknames or {}, "custom_units": custom_units or []}
+    try:
+        with open(_TAG_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+# Pre-load persisted data so stores can be initialised with it
+_INIT_NICKNAMES, _INIT_CUSTOM_UNITS = _load_tag_manager_data()
+
+
 def _num_or_none(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
@@ -362,8 +396,8 @@ app.layout = html.Div(style={
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
-    dcc.Store(id="tag-nicknames", storage_type="session", data={}),
-    dcc.Store(id="custom-units", storage_type="session", data=[]),
+    dcc.Store(id="tag-nicknames", storage_type="memory", data=_INIT_NICKNAMES),
+    dcc.Store(id="custom-units", storage_type="memory", data=_INIT_CUSTOM_UNITS),
 
     # Header toolbar
     html.Div(style={
@@ -1497,6 +1531,11 @@ def add_custom_unit(n_clicks, new_unit, custom_units):
         # Already exists -- just clear the input
         return no_update, ""
     custom_units = custom_units + [unit]
+
+    # Persist to local JSON file
+    nicknames, _ = _load_tag_manager_data()
+    _save_tag_manager_data(nicknames, custom_units)
+
     return custom_units, ""
 
 
@@ -1589,7 +1628,7 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
     prevent_initial_call=True,
 )
 def update_tag_nicknames(nicknames, units, current_data):
-    """Persist nickname and unit edits into the session store."""
+    """Persist nickname and unit edits into the session store and JSON file."""
     ctx = callback_context
     if not ctx.triggered:
         return no_update
@@ -1614,6 +1653,10 @@ def update_tag_nicknames(nicknames, units, current_data):
         if tag_code not in current_data:
             current_data[tag_code] = {}
         current_data[tag_code]["unit"] = val or ""
+
+    # Persist to local JSON file
+    _, custom_units = _load_tag_manager_data()
+    _save_tag_manager_data(current_data, custom_units)
 
     return current_data
 
