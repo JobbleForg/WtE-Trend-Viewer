@@ -211,6 +211,17 @@ WIDTH_OPTIONS = [
 ]
 DEFAULT_HEIGHT_PX = 300
 
+LOCKED_ICON_STYLE = {
+    "fontSize": "11px", "cursor": "pointer",
+    "color": "#3fb950", "lineHeight": "1",
+    "userSelect": "none", "textAlign": "center",
+}
+UNLOCKED_ICON_STYLE = {
+    "fontSize": "11px", "cursor": "pointer",
+    "color": MUTED_TEXT, "lineHeight": "1",
+    "userSelect": "none", "textAlign": "center",
+}
+
 # ---------------------------------------------------------------------------
 # Dash app
 # ---------------------------------------------------------------------------
@@ -244,11 +255,7 @@ def make_chart_panel(chart_id):
                         id={"type": "lock-scale-btn", "chart": chart_id, "series": s},
                         children="\U0001F513",
                         n_clicks=0,
-                        style={
-                            "fontSize": "11px", "cursor": "pointer",
-                            "color": MUTED_TEXT, "lineHeight": "1",
-                            "userSelect": "none", "textAlign": "center",
-                        },
+                        style=UNLOCKED_ICON_STYLE,
                         title="Lock Y-axis scale",
                     ),
                     dcc.Dropdown(
@@ -775,17 +782,6 @@ app.index_string = '''<!DOCTYPE html>
         .own-scale-check input[type="checkbox"] {
             margin-right: 2px;
         }
-        /* Lock-scale checkbox styling */
-        .lock-scale-check label {
-            color: ''' + MUTED_TEXT + ''' !important;
-            font-size: 10px !important;
-            cursor: pointer;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-        .lock-scale-check input[type="checkbox"] {
-            margin-right: 1px;
-        }
     </style>
 </head>
 <body>
@@ -803,7 +799,7 @@ app.index_string = '''<!DOCTYPE html>
 # ---------------------------------------------------------------------------
 
 @app.callback(
-    Output("visible-charts", "data"),
+    Output("visible-charts", "data", allow_duplicate=True),
     Output("sync-state", "data", allow_duplicate=True),
     Input("add-chart-btn", "n_clicks"),
     Input({"type": "close-btn", "index": ALL}, "n_clicks"),
@@ -847,10 +843,11 @@ def update_visible_charts(add_clicks, close_clicks_list, visible, sync_state):
 
 for _i in range(1, MAX_CHARTS + 1):
     @app.callback(
-        Output({"type": "chart-wrapper", "index": _i}, "style"),
+        Output({"type": "chart-wrapper", "index": _i}, "style", allow_duplicate=True),
         Input("visible-charts", "data"),
         Input({"type": "width-select", "index": _i}, "value"),
         Input({"type": "height-select", "index": _i}, "value"),
+        prevent_initial_call=True,
     )
     def update_panel_style(visible, width_val, height_val, _cid=_i):
         is_visible = _cid in (visible or [])
@@ -964,10 +961,10 @@ _load_outputs = [
 ]
 for _c in range(1, MAX_CHARTS + 1):
     for _s in range(1, NUM_SERIES + 1):
-        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "options"))
-        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "value"))
-    _load_outputs.append(Output({"type": "start-time", "index": _c}, "data"))
-    _load_outputs.append(Output({"type": "goto-date", "index": _c}, "value"))
+        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "options", allow_duplicate=True))
+        _load_outputs.append(Output({"type": "series-dd", "chart": _c, "series": _s}, "value", allow_duplicate=True))
+    _load_outputs.append(Output({"type": "start-time", "index": _c}, "data", allow_duplicate=True))
+    _load_outputs.append(Output({"type": "goto-date", "index": _c}, "value", allow_duplicate=True))
 
 
 @app.callback(
@@ -1058,8 +1055,6 @@ def _interpolate_at(df, column, timestamp):
     if ts >= times.iloc[-1]:
         return float(sub[column].iloc[-1])
     idx_after = times.searchsorted(ts)
-    if idx_after == 0:
-        return float(sub[column].iloc[0])
     idx_before = idx_after - 1
     t0, t1 = times.iloc[idx_before], times.iloc[idx_after]
     v0, v1 = float(sub[column].iloc[idx_before]), float(sub[column].iloc[idx_after])
@@ -1444,7 +1439,7 @@ for _ci in range(1, MAX_CHARTS + 1):
 
 # --- Toggle sync state when any sync button is clicked ---
 @app.callback(
-    Output("sync-state", "data"),
+    Output("sync-state", "data", allow_duplicate=True),
     [Input({"type": "sync-btn", "index": i}, "n_clicks") for i in range(1, MAX_CHARTS + 1)],
     State("sync-state", "data"),
     prevent_initial_call=True,
@@ -1551,14 +1546,7 @@ for _vi in range(1, MAX_CHARTS + 1):
             basis = "calc(50% - 5px)"
         is_master = (sync_state and sync_state.get("active")
                      and sync_state.get("master") == _cid)
-        is_locked = (sync_state and sync_state.get("active")
-                     and sync_state.get("master") != _cid)
-        if is_master:
-            border = "2px solid #00e5ff"
-        elif is_locked:
-            border = f"1px solid {BORDER_COLOR}"
-        else:
-            border = f"1px solid {BORDER_COLOR}"
+        border = "2px solid #00e5ff" if is_master else f"1px solid {BORDER_COLOR}"
         return {
             "backgroundColor": PANEL_BG, "borderRadius": "8px",
             "border": border, "padding": "8px",
@@ -2261,22 +2249,12 @@ def load_setup(selected_name, saved):
         for lv in lock_vals[:NUM_SERIES]:
             results.append(lv if lv else [])
         # Restore lock button icons to match lock state
-        _locked_btn_style = {
-            "fontSize": "11px", "cursor": "pointer",
-            "color": "#3fb950", "lineHeight": "1",
-            "userSelect": "none", "textAlign": "center",
-        }
-        _unlocked_btn_style = {
-            "fontSize": "11px", "cursor": "pointer",
-            "color": MUTED_TEXT, "lineHeight": "1",
-            "userSelect": "none", "textAlign": "center",
-        }
         for lv in lock_vals[:NUM_SERIES]:
             is_lk = "lock" in (lv or [])
             results.append("\U0001F512\u2713" if is_lk else "\U0001F513")
         for lv in lock_vals[:NUM_SERIES]:
             is_lk = "lock" in (lv or [])
-            results.append(_locked_btn_style if is_lk else _unlocked_btn_style)
+            results.append(LOCKED_ICON_STYLE if is_lk else UNLOCKED_ICON_STYLE)
         # Restore filter window values (backward-compatible: default to 1 if missing)
         filter_vals = chart_cfg.get("filter_window", [1] * NUM_SERIES)
         while len(filter_vals) < NUM_SERIES:
@@ -2410,18 +2388,10 @@ for _lb in range(1, MAX_CHARTS + 1):
                                "fontSize": "11px", "padding": "2px 10px"}
             if is_locked:
                 # Unlock
-                return [], "\U0001F513", {
-                    "fontSize": "11px", "cursor": "pointer",
-                    "color": MUTED_TEXT, "lineHeight": "1",
-                    "userSelect": "none", "textAlign": "center",
-                }, False, "\U0001F513 Lock All", btn_reset_style
+                return [], "\U0001F513", UNLOCKED_ICON_STYLE, False, "\U0001F513 Lock All", btn_reset_style
             else:
                 # Lock
-                return ["lock"], "\U0001F512\u2713", {
-                    "fontSize": "11px", "cursor": "pointer",
-                    "color": "#3fb950", "lineHeight": "1",
-                    "userSelect": "none", "textAlign": "center",
-                }, no_update, no_update, no_update
+                return ["lock"], "\U0001F512\u2713", LOCKED_ICON_STYLE, no_update, no_update, no_update
 
         toggle_lock_btn.__name__ = f"toggle_lock_btn_{_lb}_{_ls}"
 
@@ -2434,7 +2404,6 @@ for _la in range(1, MAX_CHARTS + 1):
     _lock_all_lock_outputs = []
     _lock_all_icon_outputs = []
     _lock_all_style_outputs = []
-    _lock_all_states = []
     for _s in range(1, NUM_SERIES + 1):
         _lock_all_lock_outputs.append(
             Output({"type": "lock-scale", "chart": _la, "series": _s}, "value", allow_duplicate=True))
@@ -2442,9 +2411,6 @@ for _la in range(1, MAX_CHARTS + 1):
             Output({"type": "lock-scale-btn", "chart": _la, "series": _s}, "children", allow_duplicate=True))
         _lock_all_style_outputs.append(
             Output({"type": "lock-scale-btn", "chart": _la, "series": _s}, "style", allow_duplicate=True))
-        _lock_all_states.append(
-            State({"type": "lock-scale", "chart": _la, "series": _s}, "value"))
-
     @app.callback(
         Output({"type": "lock-all-state", "index": _la}, "data", allow_duplicate=True),
         Output({"type": "lock-all-btn", "index": _la}, "children", allow_duplicate=True),
@@ -2454,7 +2420,6 @@ for _la in range(1, MAX_CHARTS + 1):
         *_lock_all_style_outputs,
         Input({"type": "lock-all-btn", "index": _la}, "n_clicks"),
         State({"type": "lock-all-state", "index": _la}, "data"),
-        *_lock_all_states,
         prevent_initial_call=True,
     )
     def toggle_lock_all(*args, _cid=_la):
@@ -2462,16 +2427,6 @@ for _la in range(1, MAX_CHARTS + 1):
         is_all_locked = args[1]
         if not n_clicks:
             return (no_update,) * (3 + NUM_SERIES * 3)
-        locked_icon_style = {
-            "fontSize": "11px", "cursor": "pointer",
-            "color": "#3fb950", "lineHeight": "1",
-            "userSelect": "none", "textAlign": "center",
-        }
-        unlocked_icon_style = {
-            "fontSize": "11px", "cursor": "pointer",
-            "color": MUTED_TEXT, "lineHeight": "1",
-            "userSelect": "none", "textAlign": "center",
-        }
         if is_all_locked:
             # Unlock all — restore to original unlocked state
             btn_style = {**BTN_STYLE, "color": MUTED_TEXT,
@@ -2482,7 +2437,7 @@ for _la in range(1, MAX_CHARTS + 1):
                 btn_style,
                 *([[] for _ in range(NUM_SERIES)]),
                 *(["\U0001F513" for _ in range(NUM_SERIES)]),
-                *([unlocked_icon_style for _ in range(NUM_SERIES)]),
+                *([UNLOCKED_ICON_STYLE for _ in range(NUM_SERIES)]),
             )
         else:
             # Lock all
@@ -2494,7 +2449,7 @@ for _la in range(1, MAX_CHARTS + 1):
                 btn_style,
                 *([["lock"] for _ in range(NUM_SERIES)]),
                 *(["\U0001F512\u2713" for _ in range(NUM_SERIES)]),
-                *([locked_icon_style for _ in range(NUM_SERIES)]),
+                *([LOCKED_ICON_STYLE for _ in range(NUM_SERIES)]),
             )
 
     toggle_lock_all.__name__ = f"toggle_lock_all_{_la}"
