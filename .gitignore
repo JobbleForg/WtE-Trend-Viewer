@@ -11,5 +11,8 @@ __pycache__/
 # Tag manager persistent data (user-specific)
 tag_manager_data.json
 
+# Autoload last-session data (user-specific)
+_last_session/
+
 # Claude Code local settings
 .claude/
