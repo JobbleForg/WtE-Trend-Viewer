@@ -206,20 +206,10 @@ def try_load_tag_refs(filepath):
         tag_code = str(tag_code).strip()
         decimals = row.iloc[11] if len(row) > 11 and not pd.isna(row.iloc[11]) else 1
         units = str(row.iloc[12]).strip() if len(row) > 12 and not pd.isna(row.iloc[12]) else ""
-        y_highs = [
-            _num_or_none(row.iloc[15]) if len(row) > 15 else None,
-            _num_or_none(row.iloc[18]) if len(row) > 18 else None,
-        ]
-        y_lows = [
-            _num_or_none(row.iloc[16]) if len(row) > 16 else None,
-            _num_or_none(row.iloc[19]) if len(row) > 19 else None,
-        ]
         tag_map[tag_code] = {
             "name": str(friendly_name).strip() if not pd.isna(friendly_name) else tag_code,
             "units": units,
             "decimals": int(decimals) if not pd.isna(decimals) else 1,
-            "y_high": next((v for v in y_highs if v is not None), None),
-            "y_low": next((v for v in y_lows if v is not None), None),
         }
 
     i = 31
@@ -1243,11 +1233,6 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             else:
                 label = series_tags
 
-        # Y-range: union of all members' y_high/y_low
-        y_hi_vals = [m[5].get("y_high") for m in members if m[5].get("y_high") is not None]
-        y_lo_vals = [m[5].get("y_low") for m in members if m[5].get("y_low") is not None]
-        y_range = [min(y_lo_vals), max(y_hi_vals)] if y_hi_vals and y_lo_vals else None
-
         # Check if any member in this group has its scale locked
         is_locked = any(
             lock_scale_flags[m[0]] if m[0] < len(lock_scale_flags) else False
@@ -1257,7 +1242,7 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         unit_to_axis[unit_key] = axis_num
         active_axes.append({
             "num": axis_num, "side": side, "offset": offset,
-            "color": axis_color, "range": y_range, "label": label,
+            "color": axis_color, "label": label,
             "unit_key": unit_key, "locked": is_locked,
         })
 
@@ -1313,8 +1298,6 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             uirevision=ax["unit_key"],
             fixedrange=ax.get("locked", False),
         )
-        if ax["range"]:
-            layout["range"] = ax["range"]
         if ax["num"] > 1:
             layout["overlaying"] = "y"
             layout["position"] = position
