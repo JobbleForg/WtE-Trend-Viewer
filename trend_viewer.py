@@ -11,8 +11,9 @@ import atexit
 import base64
 import glob
 import json
+import sqlite3
 import tempfile
-from io import StringIO
+import uuid
 import pandas as pd
 from datetime import datetime, timedelta
 from dash import Dash, dcc, html, Input, Output, State, callback_context, no_update, ALL, MATCH
@@ -35,6 +36,12 @@ def _cleanup_temp_files():
     """Remove any leftover wte_upload_* temp files on shutdown."""
     pattern = os.path.join(tempfile.gettempdir(), "wte_upload_*")
     for path in glob.glob(pattern):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    db_pattern = os.path.join(tempfile.gettempdir(), "wte_session_*.db")
+    for path in glob.glob(db_pattern):
         try:
             os.remove(path)
         except OSError:
@@ -87,6 +94,89 @@ def _num_or_none(val):
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# SQLite session helpers
+# ---------------------------------------------------------------------------
+
+def _db_path(session_id):
+    """Return the SQLite database file path for a session."""
+    return os.path.join(tempfile.gettempdir(), f"wte_session_{session_id}.db")
+
+def create_session_db(session_id, df, tag_map, chart_packages, all_tags, name_to_code, data_start, data_end):
+    """Create a SQLite database for a session and store all data."""
+    db = _db_path(session_id)
+    conn = sqlite3.connect(db)
+    df.to_sql("data", conn, if_exists="replace", index=False)
+    meta = {
+        "tag_map": tag_map,
+        "chart_packages": chart_packages,
+        "all_tags": all_tags,
+        "name_to_code": name_to_code,
+        "data_start": data_start.isoformat(),
+        "data_end": data_end.isoformat(),
+    }
+    conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("session_meta", json.dumps(meta)))
+    conn.commit()
+    conn.close()
+
+def get_metadata(session_id):
+    """Retrieve session metadata from SQLite. Returns dict or None."""
+    db = _db_path(session_id)
+    if not os.path.exists(db):
+        return None
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute("SELECT value FROM metadata WHERE key='session_meta'").fetchone()
+        if row:
+            return json.loads(row[0])
+        return None
+    finally:
+        conn.close()
+
+def query_time_slice(session_id, start_time, end_time, columns=None):
+    """Query the data table for a time range. Returns a DataFrame."""
+    db = _db_path(session_id)
+    if not os.path.exists(db):
+        return pd.DataFrame()
+    conn = sqlite3.connect(db)
+    try:
+        if columns:
+            safe_cols = [c for c in columns if c]
+            col_list = ", ".join(f'"{c}"' for c in ["Time"] + safe_cols)
+            query = f'SELECT {col_list} FROM data WHERE Time >= ? AND Time <= ? ORDER BY Time'
+        else:
+            query = 'SELECT * FROM data WHERE Time >= ? AND Time <= ? ORDER BY Time'
+        df = pd.read_sql_query(query, conn, params=[start_time.isoformat(), end_time.isoformat()])
+        if "Time" in df.columns:
+            df["Time"] = pd.to_datetime(df["Time"])
+        return df
+    finally:
+        conn.close()
+
+def query_full_data(session_id):
+    """Query the full data table. Returns a DataFrame."""
+    db = _db_path(session_id)
+    if not os.path.exists(db):
+        return pd.DataFrame()
+    conn = sqlite3.connect(db)
+    try:
+        df = pd.read_sql_query('SELECT * FROM data ORDER BY Time', conn)
+        if "Time" in df.columns:
+            df["Time"] = pd.to_datetime(df["Time"])
+        return df
+    finally:
+        conn.close()
+
+def cleanup_session_db(session_id):
+    """Remove the SQLite database file for a session."""
+    db = _db_path(session_id)
+    try:
+        os.remove(db)
+    except OSError:
+        pass
 
 
 def load_sheet_data(filepath, sheet_name):
@@ -283,6 +373,16 @@ def make_chart_panel(chart_id):
                     className="own-scale-check",
                     inline=True,
                 ),
+                dcc.Checklist(
+                    id={"type": "hide-limit", "chart": chart_id, "series": s},
+                    options=[{"label": "\u26A0", "value": "hide"}],
+                    value=[],
+                    style={"fontSize": "10px", "color": MUTED_TEXT,
+                           "display": "inline-flex", "alignItems": "center",
+                           "marginRight": "2px"},
+                    className="hide-limit-check",
+                    inline=True,
+                ),
             ])
         dropdown_rows.append(html.Div(style={
             "display": "flex", "alignItems": "center", "gap": "4px",
@@ -336,6 +436,10 @@ def make_chart_panel(chart_id):
                     className="own-scale-check",
                     inline=True,
                 ),
+                html.Button("Hide All Limits", id={"type": "hide-all-limits-btn", "index": chart_id},
+                            style={**BTN_STYLE, "fontSize": "10px", "padding": "2px 8px",
+                                   "color": "#f0883e"},
+                            title="Hide limit lines for all series on this chart"),
                 html.Button("\u2398 Copy CSV",
                             id={"type": "copy-csv-btn", "index": chart_id},
                             style={**BTN_STYLE, "color": "#d29922",
@@ -488,7 +592,7 @@ app.layout = html.Div(style={
     "fontFamily": "'Segoe UI', Consolas, monospace",
 }, children=[
     dcc.Store(id="temp-file-path", data=None),
-    dcc.Store(id="session-data", storage_type="memory", data=None),
+    dcc.Store(id="session-id", storage_type="memory", data=None),
     dcc.Store(id="visible-charts", data=list(range(1, INITIAL_VISIBLE + 1))),
     dcc.Store(id="saved-setups", storage_type="local", data={}),
     dcc.Store(id="sync-state", data={"active": False, "master": None}),
@@ -697,7 +801,7 @@ app.layout = html.Div(style={
                 # Table header
                 html.Div(style={
                     "display": "grid",
-                    "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
+                    "gridTemplateColumns": "1fr 1.5fr 1fr 1fr 0.7fr 0.7fr",
                     "gap": "6px",
                     "padding": "4px 0",
                     "borderBottom": f"1px solid {BORDER_COLOR}",
@@ -716,6 +820,14 @@ app.layout = html.Div(style={
                         "fontWeight": "bold",
                     }),
                     html.Span("Unit", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span("Limit Low", style={
+                        "color": ACCENT, "fontSize": "11px",
+                        "fontWeight": "bold",
+                    }),
+                    html.Span("Limit High", style={
                         "color": ACCENT, "fontSize": "11px",
                         "fontWeight": "bold",
                     }),
@@ -955,7 +1067,7 @@ def on_file_upload(contents, filename, old_temp_path):
 # ---------------------------------------------------------------------------
 
 _load_outputs = [
-    Output("session-data", "data"),
+    Output("session-id", "data"),
     Output("data-stats", "children"),
     Output("pkg-select", "options"),
 ]
@@ -997,16 +1109,8 @@ def on_sheet_selected(sheet_name, temp_path):
     for code, info in tag_map.items():
         name_to_code[info["name"]] = code
 
-    # Issue #4: Store session data as JSON in dcc.Store instead of global state
-    session_data = {
-        "df_json": df.to_json(date_format="iso", orient="split"),
-        "tag_map": tag_map,
-        "chart_packages": chart_packages,
-        "all_tags": all_tags,
-        "name_to_code": name_to_code,
-        "data_start": data_start.isoformat(),
-        "data_end": data_end.isoformat(),
-    }
+    session_id = str(uuid.uuid4())
+    create_session_db(session_id, df, tag_map, chart_packages, all_tags, name_to_code, data_start, data_end)
 
     stats = (
         f"Start: {data_start.strftime('%Y-%m-%d %H:%M')}  |  "
@@ -1024,7 +1128,7 @@ def on_sheet_selected(sheet_name, temp_path):
             "value": pkg["num"],
         })
 
-    results = [session_data, stats, pkg_options]
+    results = [session_id, stats, pkg_options]
     start_iso = data_start.isoformat()
     date_str = data_start.strftime("%Y-%m-%d")
     for _c in range(1, MAX_CHARTS + 1):
@@ -1066,13 +1170,15 @@ def _interpolate_at(df, column, timestamp):
 
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
                    nicknames=None, own_scale_flags=None, lock_scale_flags=None,
-                   show_limits=False, cursor_ts=None):
+                   hide_limit_flags=None, show_limits=False, cursor_ts=None,
+                   limit_overrides=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
     up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
     set are forced onto their own independent axis even when the unit matches
     another series.  Series with ``lock_scale_flags[idx]`` set have their
-    Y-axis locked (``fixedrange=True``) so it cannot be zoomed/panned."""
+    Y-axis locked (``fixedrange=True``) so it cannot be zoomed/panned.
+    Series with ``hide_limit_flags[idx]`` set have their limit lines hidden."""
     from collections import OrderedDict
 
     fig = go.Figure()
@@ -1094,6 +1200,10 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         own_scale_flags = [False] * len(selected_tags)
     if lock_scale_flags is None:
         lock_scale_flags = [False] * len(selected_tags)
+    if hide_limit_flags is None:
+        hide_limit_flags = [False] * len(selected_tags)
+    if limit_overrides is None:
+        limit_overrides = {}
 
     # --- Step 1: Gather info for every active series -----------------------
     active_series = []  # (slot_idx, tag_code, display_name, display_unit, color, info)
@@ -1207,10 +1317,17 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
     # --- Step 4b: Add threshold limit lines (Issue #11) --------------------
     limit_shapes = []
     limit_annotations = []
+    alarm_axes = {}  # axis_num -> True if alarm triggered
     if show_limits:
         for (idx, tag_code, display_name, display_unit, color, info) in active_series:
-            y_high = info.get("y_high")
-            y_low = info.get("y_low")
+            # Per-series hide-limit flag
+            is_hidden = hide_limit_flags[idx] if idx < len(hide_limit_flags) else False
+            if is_hidden:
+                continue
+            # Use limit overrides if available
+            ovr = limit_overrides.get(tag_code, {})
+            y_high = ovr.get("y_high", info.get("y_high"))
+            y_low = ovr.get("y_low", info.get("y_low"))
             if y_high is None and y_low is None:
                 continue
             is_own = own_scale_flags[idx] if idx < len(own_scale_flags) else False
@@ -1223,6 +1340,14 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
 
             r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
             line_color = f"rgba({r},{g},{b},0.45)"
+
+            # Check for alarm: data crosses limits
+            if tag_code in df_slice.columns and not df_slice.empty:
+                series_data = df_slice[tag_code].dropna()
+                if y_high is not None and (series_data > y_high).any():
+                    alarm_axes[axis_num] = True
+                if y_low is not None and (series_data < y_low).any():
+                    alarm_axes[axis_num] = True
 
             for val, label_suffix in [(y_high, "Hi"), (y_low, "Lo")]:
                 if val is None:
@@ -1266,8 +1391,14 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             position = max_left - ax["offset"]
         else:
             position = (1.0 - max_right) + ax["offset"]
+        # Feature 4b: append alarm indicator if any series on this axis breached limits
+        axis_label = ax["label"]
+        axis_color = ax["color"]
+        if alarm_axes.get(ax["num"]):
+            axis_label = "\u26A0 " + axis_label
+            axis_color = "#f85149"
         layout = dict(
-            title=dict(text=ax["label"], font=dict(color=ax["color"], size=10)),
+            title=dict(text=axis_label, font=dict(color=axis_color, size=10)),
             tickfont=dict(color=ax["color"], size=9),
             gridcolor=GRID_COLOR if ax["num"] == 1 else "rgba(0,0,0,0)",
             showgrid=(ax["num"] == 1), zeroline=False, side=ax["side"],
@@ -1323,6 +1454,10 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "filter-window", "chart": _ci, "series": s}, "value")
         for s in range(1, NUM_SERIES + 1)
     ]
+    _hide_limit_inputs = [
+        Input({"type": "hide-limit", "chart": _ci, "series": s}, "value")
+        for s in range(1, NUM_SERIES + 1)
+    ]
 
     @app.callback(
         Output({"type": "graph", "index": _ci}, "figure"),
@@ -1333,6 +1468,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         *_own_scale_inputs,
         *_lock_scale_inputs,
         *_filter_inputs,
+        *_hide_limit_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
         Input({"type": "win-min", "index": _ci}, "value"),
@@ -1344,7 +1480,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "show-limits", "index": _ci}, "value"),
         Input({"type": "cursor-ts", "index": _ci}, "data"),
         State({"type": "start-time", "index": _ci}, "data"),
-        State("session-data", "data"),
+        State("session-id", "data"),
         prevent_initial_call=True,
     )
     def update_chart(*args, _cid=_ci):
@@ -1354,22 +1490,22 @@ for _ci in range(1, MAX_CHARTS + 1):
         lock_checklists = list(args[NUM_SERIES * 2:NUM_SERIES * 3])
         lock_flags = [("lock" in (v or [])) for v in lock_checklists]
         filter_windows = list(args[NUM_SERIES * 3:NUM_SERIES * 4])
-        rest = args[NUM_SERIES * 4:]
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, show_limits_val, cursor_ts_val, start_time_iso, session_data = rest
+        hide_limit_checklists = list(args[NUM_SERIES * 4:NUM_SERIES * 5])
+        hide_limit_flags = [("hide" in (v or [])) for v in hide_limit_checklists]
+        rest = args[NUM_SERIES * 5:]
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, show_limits_val, cursor_ts_val, start_time_iso, session_id = rest
         show_limits = "limits" in (show_limits_val or [])
 
-        # Issue #4: Read from per-session store instead of global state
-        if not session_data:
+        if not session_id:
             return _build_figure(None, [], {}), no_update, no_update, no_update
+        meta = get_metadata(session_id)
+        if not meta:
+            return _build_figure(None, [], {}), no_update, no_update, no_update
+        tag_map = meta["tag_map"]
+        data_start = pd.Timestamp(meta["data_start"])
+        data_end = pd.Timestamp(meta["data_end"])
 
-        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
-        if "Time" in df.columns:
-            df["Time"] = pd.to_datetime(df["Time"])
-        tag_map = session_data["tag_map"]
-        data_start = pd.Timestamp(session_data["data_start"])
-        data_end = pd.Timestamp(session_data["data_end"])
-
-        if df.empty or data_start is None:
+        if data_start is None:
             return _build_figure(None, [], {}), no_update, no_update, no_update
 
         ctx = callback_context
@@ -1402,8 +1538,8 @@ for _ci in range(1, MAX_CHARTS + 1):
             end_time = data_end
             start_time = max(data_start, end_time - timedelta(minutes=w_min))
 
-        mask = (df["Time"] >= start_time) & (df["Time"] <= end_time)
-        df_slice = df.loc[mask].copy()
+        active_cols = [t for t in tags if t]
+        df_slice = query_time_slice(session_id, start_time, end_time, active_cols)
 
         # Apply rolling mean filter per series (Issue #18)
         for idx, tag_code in enumerate(tags):
@@ -1421,13 +1557,27 @@ for _ci in range(1, MAX_CHARTS + 1):
                     .mean()
                 )
 
+        # Build limit overrides from tag nicknames (y_low / y_high overrides)
+        limit_overrides = {}
+        for tc, nn_entry in (nn_data or {}).items():
+            lo = nn_entry.get("y_low")
+            hi = nn_entry.get("y_high")
+            if lo is not None or hi is not None:
+                limit_overrides[tc] = {}
+                if lo is not None:
+                    limit_overrides[tc]["y_low"] = lo
+                if hi is not None:
+                    limit_overrides[tc]["y_high"] = hi
+
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
                             nicknames=nn_data or {},
                             own_scale_flags=own_flags,
                             lock_scale_flags=lock_flags,
+                            hide_limit_flags=hide_limit_flags,
                             show_limits=show_limits,
-                            cursor_ts=cursor_ts_val)
+                            cursor_ts=cursor_ts_val,
+                            limit_overrides=limit_overrides)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -1829,14 +1979,17 @@ def add_custom_unit(n_clicks, new_unit, custom_units):
     Input("data-stats", "children"),
     Input("custom-units", "data"),
     State("tag-nicknames", "data"),
-    State("session-data", "data"),
+    State("session-id", "data"),
 )
-def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
+def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_id):
     """Rebuild the tag table rows whenever new data is loaded or custom units change."""
-    if not session_data:
+    if not session_id:
         return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
-    tag_map = session_data.get("tag_map", {})
-    all_tags = session_data.get("all_tags", [])
+    meta = get_metadata(session_id)
+    if not meta:
+        return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
+    tag_map = meta.get("tag_map", {})
+    all_tags = meta.get("all_tags", [])
     if not all_tags:
         return html.Span("No tags loaded.", style={"color": MUTED_TEXT, "fontSize": "12px"})
 
@@ -1862,9 +2015,11 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
         saved_nick = saved.get("nickname", "")
         saved_unit = saved.get("unit", default_unit)
 
+        saved_low = saved.get("y_low", info.get("y_low"))
+        saved_high = saved.get("y_high", info.get("y_high"))
         row = html.Div(style={
             "display": "grid",
-            "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
+            "gridTemplateColumns": "1fr 1.5fr 1fr 1fr 0.7fr 0.7fr",
             "gap": "6px",
             "padding": "3px 0",
             "alignItems": "center",
@@ -1896,6 +2051,22 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
                 style={**DROPDOWN_STYLE, "width": "100%", "fontSize": "11px"},
                 className="dark-dropdown",
             ),
+            dcc.Input(
+                id={"type": "tag-limit-low", "tag": tag_code},
+                type="number",
+                value=saved_low,
+                placeholder="Low...",
+                style={**INPUT_STYLE, "width": "100%", "fontSize": "11px"},
+                debounce=True,
+            ),
+            dcc.Input(
+                id={"type": "tag-limit-high", "tag": tag_code},
+                type="number",
+                value=saved_high,
+                placeholder="High...",
+                style={**INPUT_STYLE, "width": "100%", "fontSize": "11px"},
+                debounce=True,
+            ),
         ])
         rows.append(row)
     return rows
@@ -1909,11 +2080,13 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_data):
     Output("tag-nicknames", "data"),
     Input({"type": "tag-nickname", "tag": ALL}, "value"),
     Input({"type": "tag-unit", "tag": ALL}, "value"),
+    Input({"type": "tag-limit-low", "tag": ALL}, "value"),
+    Input({"type": "tag-limit-high", "tag": ALL}, "value"),
     State("tag-nicknames", "data"),
     prevent_initial_call=True,
 )
-def update_tag_nicknames(nicknames, units, current_data):
-    """Persist nickname and unit edits into the session store and JSON file."""
+def update_tag_nicknames(nicknames, units, limit_lows, limit_highs, current_data):
+    """Persist nickname, unit, and limit edits into the session store and JSON file."""
     ctx = callback_context
     if not ctx.triggered:
         return no_update
@@ -1924,6 +2097,8 @@ def update_tag_nicknames(nicknames, units, current_data):
     # Process all inputs via their pattern-matching IDs
     nick_inputs = ctx.inputs_list[0] if ctx.inputs_list else []
     unit_inputs = ctx.inputs_list[1] if len(ctx.inputs_list) > 1 else []
+    low_inputs = ctx.inputs_list[2] if len(ctx.inputs_list) > 2 else []
+    high_inputs = ctx.inputs_list[3] if len(ctx.inputs_list) > 3 else []
 
     for inp in nick_inputs:
         tag_code = inp["id"]["tag"]
@@ -1938,6 +2113,20 @@ def update_tag_nicknames(nicknames, units, current_data):
         if tag_code not in current_data:
             current_data[tag_code] = {}
         current_data[tag_code]["unit"] = val or ""
+
+    for inp in low_inputs:
+        tag_code = inp["id"]["tag"]
+        val = inp.get("value")
+        if tag_code not in current_data:
+            current_data[tag_code] = {}
+        current_data[tag_code]["y_low"] = _num_or_none(val)
+
+    for inp in high_inputs:
+        tag_code = inp["id"]["tag"]
+        val = inp.get("value")
+        if tag_code not in current_data:
+            current_data[tag_code] = {}
+        current_data[tag_code]["y_high"] = _num_or_none(val)
 
     # Persist to local JSON file
     _, custom_units = _load_tag_manager_data()
@@ -1961,15 +2150,18 @@ for _c in range(1, MAX_CHARTS + 1):
 @app.callback(
     _nickname_dd_outputs,
     Input("tag-nicknames", "data"),
-    State("session-data", "data"),
+    State("session-id", "data"),
     prevent_initial_call=True,
 )
-def update_dropdown_labels(nn_data, session_data):
+def update_dropdown_labels(nn_data, session_id):
     """Rebuild series dropdown options when tag nicknames or units change."""
-    if not session_data:
+    if not session_id:
         return [no_update] * len(_nickname_dd_outputs)
-    tag_map = session_data.get("tag_map", {})
-    all_tags = session_data.get("all_tags", [])
+    meta = get_metadata(session_id)
+    if not meta:
+        return [no_update] * len(_nickname_dd_outputs)
+    tag_map = meta.get("tag_map", {})
+    all_tags = meta.get("all_tags", [])
     if not all_tags:
         return [no_update] * len(_nickname_dd_outputs)
 
@@ -2006,18 +2198,20 @@ _pkg_outputs = [
 @app.callback(
     _pkg_outputs,
     Input("pkg-select", "value"),
-    State("session-data", "data"),
+    State("session-id", "data"),
     prevent_initial_call=True,
 )
-def load_chart_package(pkg_num, session_data):
+def load_chart_package(pkg_num, session_id):
     if not pkg_num:
         return [no_update] * NUM_SERIES
-    # Issue #4: Read from per-session store instead of global state
-    if not session_data:
+    if not session_id:
         return [no_update] * NUM_SERIES
-    name_to_code = session_data["name_to_code"]
-    all_tags = session_data["all_tags"]
-    for pkg in session_data["chart_packages"]:
+    meta = get_metadata(session_id)
+    if not meta:
+        return [no_update] * NUM_SERIES
+    name_to_code = meta["name_to_code"]
+    all_tags = meta["all_tags"]
+    for pkg in meta["chart_packages"]:
         if pkg["num"] == pkg_num:
             codes = []
             for n in pkg["tags"]:
@@ -2050,6 +2244,8 @@ for _c in range(1, MAX_CHARTS + 1):
         _save_states.append(State({"type": "lock-scale", "chart": _c, "series": _s}, "value"))
     for _s in range(1, NUM_SERIES + 1):
         _save_states.append(State({"type": "filter-window", "chart": _c, "series": _s}, "value"))
+    for _s in range(1, NUM_SERIES + 1):
+        _save_states.append(State({"type": "hide-limit", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
     _save_states.append(State({"type": "start-time", "index": _c}, "data"))
@@ -2084,8 +2280,8 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, sync
     if saved is None:
         saved = {}
 
-    # Parse chart_args: series + own-scale + lock-scale + filter-window + width + height + time settings per chart
-    per_chart = NUM_SERIES * 4 + 8
+    # Parse chart_args: series + own-scale + lock-scale + filter-window + hide-limit + width + height + time settings per chart
+    per_chart = NUM_SERIES * 5 + 8
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
@@ -2093,19 +2289,21 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, sync
         own_vals = list(chart_args[offset + NUM_SERIES:offset + NUM_SERIES * 2])
         lock_vals = list(chart_args[offset + NUM_SERIES * 2:offset + NUM_SERIES * 3])
         filter_vals = list(chart_args[offset + NUM_SERIES * 3:offset + NUM_SERIES * 4])
-        width_val = chart_args[offset + NUM_SERIES * 4]
-        height_val = chart_args[offset + NUM_SERIES * 4 + 1]
-        start_time_val = chart_args[offset + NUM_SERIES * 4 + 2]
-        goto_date_val = chart_args[offset + NUM_SERIES * 4 + 3]
-        goto_time_val = chart_args[offset + NUM_SERIES * 4 + 4]
-        win_min_val = chart_args[offset + NUM_SERIES * 4 + 5]
-        win_hr_val = chart_args[offset + NUM_SERIES * 4 + 6]
-        step_val = chart_args[offset + NUM_SERIES * 4 + 7]
+        hide_limit_vals = list(chart_args[offset + NUM_SERIES * 4:offset + NUM_SERIES * 5])
+        width_val = chart_args[offset + NUM_SERIES * 5]
+        height_val = chart_args[offset + NUM_SERIES * 5 + 1]
+        start_time_val = chart_args[offset + NUM_SERIES * 5 + 2]
+        goto_date_val = chart_args[offset + NUM_SERIES * 5 + 3]
+        goto_time_val = chart_args[offset + NUM_SERIES * 5 + 4]
+        win_min_val = chart_args[offset + NUM_SERIES * 5 + 5]
+        win_hr_val = chart_args[offset + NUM_SERIES * 5 + 6]
+        step_val = chart_args[offset + NUM_SERIES * 5 + 7]
         charts_config[str(c + 1)] = {
             "series": series_vals,
             "own_scale": own_vals,
             "lock_scale": lock_vals,
             "filter_window": filter_vals,
+            "hide_limit": hide_limit_vals,
             "width": width_val,
             "height": height_val,
             "start_time": start_time_val,
@@ -2186,6 +2384,10 @@ for _c in range(1, MAX_CHARTS + 1):
         _load_setup_outputs.append(
             Output({"type": "filter-window", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
+    for _s in range(1, NUM_SERIES + 1):
+        _load_setup_outputs.append(
+            Output({"type": "hide-limit", "chart": _c, "series": _s}, "value", allow_duplicate=True)
+        )
     _load_setup_outputs.append(
         Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
     )
@@ -2261,6 +2463,12 @@ def load_setup(selected_name, saved):
             filter_vals.append(1)
         for fv in filter_vals[:NUM_SERIES]:
             results.append(fv if fv else 1)
+        # Restore hide-limit flags (backward-compatible: default to [] if missing)
+        hide_limit_vals = chart_cfg.get("hide_limit", [[] for _ in range(NUM_SERIES)])
+        while len(hide_limit_vals) < NUM_SERIES:
+            hide_limit_vals.append([])
+        for hlv in hide_limit_vals[:NUM_SERIES]:
+            results.append(hlv if hlv else [])
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", DEFAULT_HEIGHT_PX))
         # Restore time settings (backward-compatible: sensible defaults)
@@ -2456,6 +2664,38 @@ for _la in range(1, MAX_CHARTS + 1):
 
 
 # ---------------------------------------------------------------------------
+# Hide All Limits button: toggle hide-limit checklist for all series
+# ---------------------------------------------------------------------------
+
+for _hal in range(1, MAX_CHARTS + 1):
+    _hide_all_outputs = [
+        Output({"type": "hide-limit", "chart": _hal, "series": _s}, "value", allow_duplicate=True)
+        for _s in range(1, NUM_SERIES + 1)
+    ]
+
+    @app.callback(
+        *_hide_all_outputs,
+        Input({"type": "hide-all-limits-btn", "index": _hal}, "n_clicks"),
+        [State({"type": "hide-limit", "chart": _hal, "series": _s}, "value")
+         for _s in range(1, NUM_SERIES + 1)],
+        prevent_initial_call=True,
+    )
+    def hide_all_limits(*args, _cid=_hal):
+        n_clicks = args[0]
+        current_vals = args[1:]
+        if not n_clicks:
+            return (no_update,) * NUM_SERIES
+        # If any series is NOT hidden, hide all; otherwise show all
+        any_visible = any("hide" not in (v or []) for v in current_vals)
+        if any_visible:
+            return (["hide"],) * NUM_SERIES
+        else:
+            return ([],) * NUM_SERIES
+
+    hide_all_limits.__name__ = f"hide_all_limits_{_hal}"
+
+
+# ---------------------------------------------------------------------------
 # Autoscale X: reset X-axis to full data range, keeping Y-axes untouched
 # ---------------------------------------------------------------------------
 
@@ -2467,15 +2707,18 @@ for _ax in range(1, MAX_CHARTS + 1):
         Output({"type": "win-min", "index": _ax}, "value", allow_duplicate=True),
         Output({"type": "win-hr", "index": _ax}, "value", allow_duplicate=True),
         Input({"type": "autoscale-x-btn", "index": _ax}, "n_clicks"),
-        State("session-data", "data"),
+        State("session-id", "data"),
         prevent_initial_call=True,
     )
-    def autoscale_x(n_clicks, session_data, _cid=_ax):
+    def autoscale_x(n_clicks, session_id, _cid=_ax):
         """Reset X-axis to full data range without affecting Y-axes."""
-        if not n_clicks or not session_data:
+        if not n_clicks or not session_id:
             return no_update, no_update, no_update, no_update, no_update
-        data_start = session_data.get("data_start")
-        data_end = session_data.get("data_end")
+        meta = get_metadata(session_id)
+        if not meta:
+            return no_update, no_update, no_update, no_update, no_update
+        data_start = meta.get("data_start")
+        data_end = meta.get("data_end")
         if not data_start or not data_end:
             return no_update, no_update, no_update, no_update, no_update
         t0 = pd.Timestamp(data_start)
@@ -2514,28 +2757,28 @@ for _csv in range(1, MAX_CHARTS + 1):
         State({"type": "start-time", "index": _csv}, "data"),
         State({"type": "win-min", "index": _csv}, "value"),
         State({"type": "win-hr", "index": _csv}, "value"),
-        State("session-data", "data"),
+        State("session-id", "data"),
         State("tag-nicknames", "data"),
         *_csv_series_states,
         prevent_initial_call=True,
     )
     def build_csv(n_clicks, start_time_iso, win_min, win_hr,
-                  session_data, nn_data, *series_vals, _cid=_csv):
-        if not n_clicks or not session_data:
+                  session_id, nn_data, *series_vals, _cid=_csv):
+        if not n_clicks or not session_id:
             return no_update, no_update
-        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
-        if "Time" in df.columns:
-            df["Time"] = pd.to_datetime(df["Time"])
-        tag_map = session_data.get("tag_map", {})
-        data_start = pd.Timestamp(session_data["data_start"])
+        meta = get_metadata(session_id)
+        if not meta:
+            return no_update, no_update
+        tag_map = meta.get("tag_map", {})
+        data_start = pd.Timestamp(meta["data_start"])
 
         start = pd.Timestamp(start_time_iso) if start_time_iso else data_start
         w_min = (win_min or 0) + (win_hr or 0) * 60
         if w_min <= 0:
             w_min = 60
         end = start + timedelta(minutes=w_min)
-        mask = (df["Time"] >= start) & (df["Time"] <= end)
-        df_slice = df.loc[mask]
+        active_cols = [t for t in series_vals if t]
+        df_slice = query_time_slice(session_id, start, end, active_cols)
 
         # Collect active tags in order
         active_tags = [t for t in series_vals if t and t in df_slice.columns]
@@ -2628,24 +2871,25 @@ for _ro in range(1, MAX_CHARTS + 1):
         Output({"type": "cursor-readout", "index": _ro}, "style"),
         Output({"type": "cursor-readout-text", "index": _ro}, "children"),
         Input({"type": "cursor-ts", "index": _ro}, "data"),
-        State("session-data", "data"),
+        State("session-id", "data"),
         State("tag-nicknames", "data"),
         *_ro_series_states,
         prevent_initial_call=True,
     )
-    def update_cursor_readout(cursor_ts, session_data, nn_data, *series_vals,
+    def update_cursor_readout(cursor_ts, session_id, nn_data, *series_vals,
                               _cid=_ro):
-        if cursor_ts is None or not session_data:
+        if cursor_ts is None or not session_id:
             return {"display": "none"}, ""
         try:
             cursor_t = pd.Timestamp(cursor_ts)
         except Exception:
             return {"display": "none"}, ""
 
-        df = pd.read_json(StringIO(session_data["df_json"]), orient="split")
-        if "Time" in df.columns:
-            df["Time"] = pd.to_datetime(df["Time"])
-        tag_map = session_data.get("tag_map", {})
+        meta = get_metadata(session_id)
+        if not meta:
+            return {"display": "none"}, ""
+        df = query_full_data(session_id)
+        tag_map = meta.get("tag_map", {})
         nn = nn_data or {}
 
         parts = [html.Span(
