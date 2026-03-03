@@ -373,16 +373,6 @@ def make_chart_panel(chart_id):
                     className="own-scale-check",
                     inline=True,
                 ),
-                dcc.Checklist(
-                    id={"type": "hide-limit", "chart": chart_id, "series": s},
-                    options=[{"label": "\u26A0", "value": "hide"}],
-                    value=[],
-                    style={"fontSize": "10px", "color": MUTED_TEXT,
-                           "display": "inline-flex", "alignItems": "center",
-                           "marginRight": "2px"},
-                    className="hide-limit-check",
-                    inline=True,
-                ),
             ])
         dropdown_rows.append(html.Div(style={
             "display": "flex", "alignItems": "center", "gap": "4px",
@@ -427,19 +417,6 @@ def make_chart_panel(chart_id):
                 ),
                 html.Span("px", style={**LABEL_STYLE, "fontSize": "10px",
                                         "color": MUTED_TEXT}),
-                dcc.Checklist(
-                    id={"type": "show-limits", "index": chart_id},
-                    options=[{"label": "Limits", "value": "limits"}],
-                    value=["limits"],
-                    style={"fontSize": "10px", "color": MUTED_TEXT,
-                           "display": "inline-flex", "alignItems": "center"},
-                    className="own-scale-check",
-                    inline=True,
-                ),
-                html.Button("Hide All Limits", id={"type": "hide-all-limits-btn", "index": chart_id},
-                            style={**BTN_STYLE, "fontSize": "10px", "padding": "2px 8px",
-                                   "color": "#f0883e"},
-                            title="Hide limit lines for all series on this chart"),
                 html.Button("\u2398 Copy CSV",
                             id={"type": "copy-csv-btn", "index": chart_id},
                             style={**BTN_STYLE, "color": "#d29922",
@@ -801,7 +778,7 @@ app.layout = html.Div(style={
                 # Table header
                 html.Div(style={
                     "display": "grid",
-                    "gridTemplateColumns": "1fr 1.5fr 1fr 1fr 0.7fr 0.7fr",
+                    "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
                     "gap": "6px",
                     "padding": "4px 0",
                     "borderBottom": f"1px solid {BORDER_COLOR}",
@@ -820,14 +797,6 @@ app.layout = html.Div(style={
                         "fontWeight": "bold",
                     }),
                     html.Span("Unit", style={
-                        "color": ACCENT, "fontSize": "11px",
-                        "fontWeight": "bold",
-                    }),
-                    html.Span("Limit Low", style={
-                        "color": ACCENT, "fontSize": "11px",
-                        "fontWeight": "bold",
-                    }),
-                    html.Span("Limit High", style={
                         "color": ACCENT, "fontSize": "11px",
                         "fontWeight": "bold",
                     }),
@@ -1170,15 +1139,13 @@ def _interpolate_at(df, column, timestamp):
 
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
                    nicknames=None, own_scale_flags=None, lock_scale_flags=None,
-                   hide_limit_flags=None, show_limits=False, cursor_ts=None,
-                   limit_overrides=None):
+                   cursor_ts=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
     up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
     set are forced onto their own independent axis even when the unit matches
     another series.  Series with ``lock_scale_flags[idx]`` set have their
-    Y-axis locked (``fixedrange=True``) so it cannot be zoomed/panned.
-    Series with ``hide_limit_flags[idx]`` set have their limit lines hidden."""
+    Y-axis locked (``fixedrange=True``) so it cannot be zoomed/panned."""
     from collections import OrderedDict
 
     fig = go.Figure()
@@ -1200,10 +1167,6 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         own_scale_flags = [False] * len(selected_tags)
     if lock_scale_flags is None:
         lock_scale_flags = [False] * len(selected_tags)
-    if hide_limit_flags is None:
-        hide_limit_flags = [False] * len(selected_tags)
-    if limit_overrides is None:
-        limit_overrides = {}
 
     # --- Step 1: Gather info for every active series -----------------------
     active_series = []  # (slot_idx, tag_code, display_name, display_unit, color, info)
@@ -1314,59 +1277,8 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             line=dict(color=color, width=1.5), mode="lines",
         ))
 
-    # --- Step 4b: Add threshold limit lines (Issue #11) --------------------
-    limit_shapes = []
-    limit_annotations = []
-    alarm_axes = {}  # axis_num -> True if alarm triggered
-    if show_limits:
-        for (idx, tag_code, display_name, display_unit, color, info) in active_series:
-            # Per-series hide-limit flag
-            is_hidden = hide_limit_flags[idx] if idx < len(hide_limit_flags) else False
-            if is_hidden:
-                continue
-            # Use limit overrides if available
-            ovr = limit_overrides.get(tag_code, {})
-            y_high = ovr.get("y_high", info.get("y_high"))
-            y_low = ovr.get("y_low", info.get("y_low"))
-            if y_high is None and y_low is None:
-                continue
-            is_own = own_scale_flags[idx] if idx < len(own_scale_flags) else False
-            if is_own or not display_unit:
-                unit_key = f"_own_{tag_code}"
-            else:
-                unit_key = display_unit
-            axis_num = unit_to_axis[unit_key]
-            yref = "y" if axis_num == 1 else f"y{axis_num}"
-
-            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
-            line_color = f"rgba({r},{g},{b},0.45)"
-
-            # Check for alarm: data crosses limits
-            if tag_code in df_slice.columns and not df_slice.empty:
-                series_data = df_slice[tag_code].dropna()
-                if y_high is not None and (series_data > y_high).any():
-                    alarm_axes[axis_num] = True
-                if y_low is not None and (series_data < y_low).any():
-                    alarm_axes[axis_num] = True
-
-            for val, label_suffix in [(y_high, "Hi"), (y_low, "Lo")]:
-                if val is None:
-                    continue
-                limit_shapes.append(dict(
-                    type="line", xref="paper", x0=0, x1=1,
-                    yref=yref, y0=val, y1=val,
-                    line=dict(color=line_color, width=1.2, dash="dash"),
-                    layer="above",
-                ))
-                limit_annotations.append(dict(
-                    text=f"S{idx+1} {label_suffix}: {val}",
-                    xref="paper", x=1.0, yref=yref, y=val,
-                    xanchor="left", showarrow=False,
-                    font=dict(size=9, color=line_color),
-                    bgcolor="rgba(13,17,23,0.7)",
-                ))
-
     # --- Step 4c: Add cursor vertical line (Issue #9) ----------------------
+    limit_shapes = []
     if cursor_ts:
         try:
             ct = pd.Timestamp(cursor_ts)
@@ -1391,12 +1303,8 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
             position = max_left - ax["offset"]
         else:
             position = (1.0 - max_right) + ax["offset"]
-        # Feature 4b: append alarm indicator if any series on this axis breached limits
         axis_label = ax["label"]
         axis_color = ax["color"]
-        if alarm_axes.get(ax["num"]):
-            axis_label = "\u26A0 " + axis_label
-            axis_color = "#f85149"
         layout = dict(
             title=dict(text=axis_label, font=dict(color=axis_color, size=10)),
             tickfont=dict(color=ax["color"], size=9),
@@ -1427,7 +1335,6 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         uirevision="keep",
         hovermode="x unified",
         shapes=limit_shapes,
-        annotations=limit_annotations,
         **yaxis_layouts,
     )
     return fig
@@ -1454,10 +1361,6 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "filter-window", "chart": _ci, "series": s}, "value")
         for s in range(1, NUM_SERIES + 1)
     ]
-    _hide_limit_inputs = [
-        Input({"type": "hide-limit", "chart": _ci, "series": s}, "value")
-        for s in range(1, NUM_SERIES + 1)
-    ]
 
     @app.callback(
         Output({"type": "graph", "index": _ci}, "figure"),
@@ -1468,7 +1371,6 @@ for _ci in range(1, MAX_CHARTS + 1):
         *_own_scale_inputs,
         *_lock_scale_inputs,
         *_filter_inputs,
-        *_hide_limit_inputs,
         Input({"type": "goto-date", "index": _ci}, "value"),
         Input({"type": "goto-time", "index": _ci}, "value"),
         Input({"type": "win-min", "index": _ci}, "value"),
@@ -1477,7 +1379,6 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input({"type": "scroll-left", "index": _ci}, "n_clicks"),
         Input({"type": "scroll-right", "index": _ci}, "n_clicks"),
         Input("tag-nicknames", "data"),
-        Input({"type": "show-limits", "index": _ci}, "value"),
         Input({"type": "cursor-ts", "index": _ci}, "data"),
         State({"type": "start-time", "index": _ci}, "data"),
         State("session-id", "data"),
@@ -1490,11 +1391,8 @@ for _ci in range(1, MAX_CHARTS + 1):
         lock_checklists = list(args[NUM_SERIES * 2:NUM_SERIES * 3])
         lock_flags = [("lock" in (v or [])) for v in lock_checklists]
         filter_windows = list(args[NUM_SERIES * 3:NUM_SERIES * 4])
-        hide_limit_checklists = list(args[NUM_SERIES * 4:NUM_SERIES * 5])
-        hide_limit_flags = [("hide" in (v or [])) for v in hide_limit_checklists]
-        rest = args[NUM_SERIES * 5:]
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, show_limits_val, cursor_ts_val, start_time_iso, session_id = rest
-        show_limits = "limits" in (show_limits_val or [])
+        rest = args[NUM_SERIES * 4:]
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, cursor_ts_val, start_time_iso, session_id = rest
 
         if not session_id:
             return _build_figure(None, [], {}), no_update, no_update, no_update
@@ -1557,27 +1455,12 @@ for _ci in range(1, MAX_CHARTS + 1):
                     .mean()
                 )
 
-        # Build limit overrides from tag nicknames (y_low / y_high overrides)
-        limit_overrides = {}
-        for tc, nn_entry in (nn_data or {}).items():
-            lo = nn_entry.get("y_low")
-            hi = nn_entry.get("y_high")
-            if lo is not None or hi is not None:
-                limit_overrides[tc] = {}
-                if lo is not None:
-                    limit_overrides[tc]["y_low"] = lo
-                if hi is not None:
-                    limit_overrides[tc]["y_high"] = hi
-
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
                             nicknames=nn_data or {},
                             own_scale_flags=own_flags,
                             lock_scale_flags=lock_flags,
-                            hide_limit_flags=hide_limit_flags,
-                            show_limits=show_limits,
-                            cursor_ts=cursor_ts_val,
-                            limit_overrides=limit_overrides)
+                            cursor_ts=cursor_ts_val)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
@@ -2015,11 +1898,9 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_id):
         saved_nick = saved.get("nickname", "")
         saved_unit = saved.get("unit", default_unit)
 
-        saved_low = saved.get("y_low", info.get("y_low"))
-        saved_high = saved.get("y_high", info.get("y_high"))
         row = html.Div(style={
             "display": "grid",
-            "gridTemplateColumns": "1fr 1.5fr 1fr 1fr 0.7fr 0.7fr",
+            "gridTemplateColumns": "1fr 1.5fr 1fr 1fr",
             "gap": "6px",
             "padding": "3px 0",
             "alignItems": "center",
@@ -2051,22 +1932,6 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_id):
                 style={**DROPDOWN_STYLE, "width": "100%", "fontSize": "11px"},
                 className="dark-dropdown",
             ),
-            dcc.Input(
-                id={"type": "tag-limit-low", "tag": tag_code},
-                type="number",
-                value=saved_low,
-                placeholder="Low...",
-                style={**INPUT_STYLE, "width": "100%", "fontSize": "11px"},
-                debounce=True,
-            ),
-            dcc.Input(
-                id={"type": "tag-limit-high", "tag": tag_code},
-                type="number",
-                value=saved_high,
-                placeholder="High...",
-                style={**INPUT_STYLE, "width": "100%", "fontSize": "11px"},
-                debounce=True,
-            ),
         ])
         rows.append(row)
     return rows
@@ -2080,13 +1945,11 @@ def populate_tag_rows(stats_text, custom_units, saved_nicknames, session_id):
     Output("tag-nicknames", "data"),
     Input({"type": "tag-nickname", "tag": ALL}, "value"),
     Input({"type": "tag-unit", "tag": ALL}, "value"),
-    Input({"type": "tag-limit-low", "tag": ALL}, "value"),
-    Input({"type": "tag-limit-high", "tag": ALL}, "value"),
     State("tag-nicknames", "data"),
     prevent_initial_call=True,
 )
-def update_tag_nicknames(nicknames, units, limit_lows, limit_highs, current_data):
-    """Persist nickname, unit, and limit edits into the session store and JSON file."""
+def update_tag_nicknames(nicknames, units, current_data):
+    """Persist nickname and unit edits into the session store and JSON file."""
     ctx = callback_context
     if not ctx.triggered:
         return no_update
@@ -2097,8 +1960,6 @@ def update_tag_nicknames(nicknames, units, limit_lows, limit_highs, current_data
     # Process all inputs via their pattern-matching IDs
     nick_inputs = ctx.inputs_list[0] if ctx.inputs_list else []
     unit_inputs = ctx.inputs_list[1] if len(ctx.inputs_list) > 1 else []
-    low_inputs = ctx.inputs_list[2] if len(ctx.inputs_list) > 2 else []
-    high_inputs = ctx.inputs_list[3] if len(ctx.inputs_list) > 3 else []
 
     for inp in nick_inputs:
         tag_code = inp["id"]["tag"]
@@ -2113,20 +1974,6 @@ def update_tag_nicknames(nicknames, units, limit_lows, limit_highs, current_data
         if tag_code not in current_data:
             current_data[tag_code] = {}
         current_data[tag_code]["unit"] = val or ""
-
-    for inp in low_inputs:
-        tag_code = inp["id"]["tag"]
-        val = inp.get("value")
-        if tag_code not in current_data:
-            current_data[tag_code] = {}
-        current_data[tag_code]["y_low"] = _num_or_none(val)
-
-    for inp in high_inputs:
-        tag_code = inp["id"]["tag"]
-        val = inp.get("value")
-        if tag_code not in current_data:
-            current_data[tag_code] = {}
-        current_data[tag_code]["y_high"] = _num_or_none(val)
 
     # Persist to local JSON file
     _, custom_units = _load_tag_manager_data()
@@ -2244,8 +2091,6 @@ for _c in range(1, MAX_CHARTS + 1):
         _save_states.append(State({"type": "lock-scale", "chart": _c, "series": _s}, "value"))
     for _s in range(1, NUM_SERIES + 1):
         _save_states.append(State({"type": "filter-window", "chart": _c, "series": _s}, "value"))
-    for _s in range(1, NUM_SERIES + 1):
-        _save_states.append(State({"type": "hide-limit", "chart": _c, "series": _s}, "value"))
     _save_states.append(State({"type": "width-select", "index": _c}, "value"))
     _save_states.append(State({"type": "height-select", "index": _c}, "value"))
     _save_states.append(State({"type": "start-time", "index": _c}, "data"))
@@ -2280,8 +2125,8 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, sync
     if saved is None:
         saved = {}
 
-    # Parse chart_args: series + own-scale + lock-scale + filter-window + hide-limit + width + height + time settings per chart
-    per_chart = NUM_SERIES * 5 + 8
+    # Parse chart_args: series + own-scale + lock-scale + filter-window + width + height + time settings per chart
+    per_chart = NUM_SERIES * 4 + 8
     charts_config = {}
     for c in range(MAX_CHARTS):
         offset = c * per_chart
@@ -2289,21 +2134,19 @@ def save_setup(n_clicks, setup_name, saved, visible, file_name, sheet_name, sync
         own_vals = list(chart_args[offset + NUM_SERIES:offset + NUM_SERIES * 2])
         lock_vals = list(chart_args[offset + NUM_SERIES * 2:offset + NUM_SERIES * 3])
         filter_vals = list(chart_args[offset + NUM_SERIES * 3:offset + NUM_SERIES * 4])
-        hide_limit_vals = list(chart_args[offset + NUM_SERIES * 4:offset + NUM_SERIES * 5])
-        width_val = chart_args[offset + NUM_SERIES * 5]
-        height_val = chart_args[offset + NUM_SERIES * 5 + 1]
-        start_time_val = chart_args[offset + NUM_SERIES * 5 + 2]
-        goto_date_val = chart_args[offset + NUM_SERIES * 5 + 3]
-        goto_time_val = chart_args[offset + NUM_SERIES * 5 + 4]
-        win_min_val = chart_args[offset + NUM_SERIES * 5 + 5]
-        win_hr_val = chart_args[offset + NUM_SERIES * 5 + 6]
-        step_val = chart_args[offset + NUM_SERIES * 5 + 7]
+        width_val = chart_args[offset + NUM_SERIES * 4]
+        height_val = chart_args[offset + NUM_SERIES * 4 + 1]
+        start_time_val = chart_args[offset + NUM_SERIES * 4 + 2]
+        goto_date_val = chart_args[offset + NUM_SERIES * 4 + 3]
+        goto_time_val = chart_args[offset + NUM_SERIES * 4 + 4]
+        win_min_val = chart_args[offset + NUM_SERIES * 4 + 5]
+        win_hr_val = chart_args[offset + NUM_SERIES * 4 + 6]
+        step_val = chart_args[offset + NUM_SERIES * 4 + 7]
         charts_config[str(c + 1)] = {
             "series": series_vals,
             "own_scale": own_vals,
             "lock_scale": lock_vals,
             "filter_window": filter_vals,
-            "hide_limit": hide_limit_vals,
             "width": width_val,
             "height": height_val,
             "start_time": start_time_val,
@@ -2384,10 +2227,6 @@ for _c in range(1, MAX_CHARTS + 1):
         _load_setup_outputs.append(
             Output({"type": "filter-window", "chart": _c, "series": _s}, "value", allow_duplicate=True)
         )
-    for _s in range(1, NUM_SERIES + 1):
-        _load_setup_outputs.append(
-            Output({"type": "hide-limit", "chart": _c, "series": _s}, "value", allow_duplicate=True)
-        )
     _load_setup_outputs.append(
         Output({"type": "width-select", "index": _c}, "value", allow_duplicate=True)
     )
@@ -2463,12 +2302,6 @@ def load_setup(selected_name, saved):
             filter_vals.append(1)
         for fv in filter_vals[:NUM_SERIES]:
             results.append(fv if fv else 1)
-        # Restore hide-limit flags (backward-compatible: default to [] if missing)
-        hide_limit_vals = chart_cfg.get("hide_limit", [[] for _ in range(NUM_SERIES)])
-        while len(hide_limit_vals) < NUM_SERIES:
-            hide_limit_vals.append([])
-        for hlv in hide_limit_vals[:NUM_SERIES]:
-            results.append(hlv if hlv else [])
         results.append(chart_cfg.get("width", "half"))
         results.append(chart_cfg.get("height", DEFAULT_HEIGHT_PX))
         # Restore time settings (backward-compatible: sensible defaults)
@@ -2661,38 +2494,6 @@ for _la in range(1, MAX_CHARTS + 1):
             )
 
     toggle_lock_all.__name__ = f"toggle_lock_all_{_la}"
-
-
-# ---------------------------------------------------------------------------
-# Hide All Limits button: toggle hide-limit checklist for all series
-# ---------------------------------------------------------------------------
-
-for _hal in range(1, MAX_CHARTS + 1):
-    _hide_all_outputs = [
-        Output({"type": "hide-limit", "chart": _hal, "series": _s}, "value", allow_duplicate=True)
-        for _s in range(1, NUM_SERIES + 1)
-    ]
-
-    @app.callback(
-        *_hide_all_outputs,
-        Input({"type": "hide-all-limits-btn", "index": _hal}, "n_clicks"),
-        [State({"type": "hide-limit", "chart": _hal, "series": _s}, "value")
-         for _s in range(1, NUM_SERIES + 1)],
-        prevent_initial_call=True,
-    )
-    def hide_all_limits(*args, _cid=_hal):
-        n_clicks = args[0]
-        current_vals = args[1:]
-        if not n_clicks:
-            return (no_update,) * NUM_SERIES
-        # If any series is NOT hidden, hide all; otherwise show all
-        any_visible = any("hide" not in (v or []) for v in current_vals)
-        if any_visible:
-            return (["hide"],) * NUM_SERIES
-        else:
-            return ([],) * NUM_SERIES
-
-    hide_all_limits.__name__ = f"hide_all_limits_{_hal}"
 
 
 # ---------------------------------------------------------------------------
