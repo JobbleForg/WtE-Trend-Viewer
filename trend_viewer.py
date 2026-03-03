@@ -415,6 +415,14 @@ def make_chart_panel(chart_id):
                     style={**INPUT_STYLE, "width": "70px", "fontSize": "11px"},
                     debounce=True,
                 ),
+                html.Span("V.Ruler:", style={**LABEL_STYLE, "fontSize": "11px"}),
+                dcc.Input(
+                    id={"type": "ruler-time", "index": chart_id},
+                    type="text",
+                    placeholder="HH:MM:SS",
+                    style={**INPUT_STYLE, "width": "80px", "fontSize": "11px"},
+                    debounce=True,
+                ),
                 html.Button("\u2398 Copy CSV",
                             id={"type": "copy-csv-btn", "index": chart_id},
                             style={**BTN_STYLE, "color": "#d29922",
@@ -1137,7 +1145,7 @@ def _interpolate_at(df, column, timestamp):
 
 def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
                    nicknames=None, own_scale_flags=None, lock_scale_flags=None,
-                   cursor_ts=None, ruler_y=None):
+                   cursor_ts=None, ruler_y=None, ruler_time=None):
     """Build a Plotly figure.  Tags that share the same effective unit are
     drawn on a single shared Y-axis so the chart stays readable even with
     up to 10 active series.  Series whose slot has ``own_scale_flags[idx]``
@@ -1303,6 +1311,43 @@ def _build_figure(df_slice, selected_tags, tag_map, x_revision=None,
         except (ValueError, TypeError):
             pass
 
+    # --- Step 4e: Add vertical ruler line -----------------------------------
+    if ruler_time is not None:
+        try:
+            rt = pd.Timestamp(ruler_time)
+            limit_shapes.append(dict(
+                type="line", xref="x", x0=rt, x1=rt,
+                yref="paper", y0=0, y1=1,
+                line=dict(color="#58a6ff", width=1.5, dash="dash"),
+                layer="above",
+            ))
+            # Time annotation at top of ruler
+            fig.add_annotation(
+                xref="x", x=rt, yref="paper", y=1.0,
+                text=rt.strftime("  %H:%M:%S"), showarrow=False,
+                font=dict(color="#58a6ff", size=10),
+                yanchor="bottom", xanchor="left",
+            )
+            # Value annotations at each trace intersection
+            for (idx, tag_code, display_name, display_unit, color, info) in active_series:
+                val = _interpolate_at(df_slice, tag_code, rt)
+                if val is not None and not pd.isna(val):
+                    is_own = own_scale_flags[idx] if idx < len(own_scale_flags) else False
+                    if is_own or not display_unit:
+                        ukey = f"_own_{tag_code}"
+                    else:
+                        ukey = display_unit
+                    ax_num = unit_to_axis[ukey]
+                    yref = "y" if ax_num == 1 else f"y{ax_num}"
+                    fig.add_annotation(
+                        xref="x", x=rt, yref=yref, y=val,
+                        text=f" {val:g}", showarrow=False,
+                        font=dict(color=color, size=9),
+                        xanchor="left", bgcolor="rgba(0,0,0,0.6)",
+                    )
+        except Exception:
+            pass
+
     # --- Step 5: Build Y-axis layout dicts ---------------------------------
     max_left = max((a["offset"] for a in active_axes if a["side"] == "left"), default=0)
     max_right = max((a["offset"] for a in active_axes if a["side"] == "right"), default=0)
@@ -1391,6 +1436,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         Input("tag-nicknames", "data"),
         Input({"type": "cursor-ts", "index": _ci}, "data"),
         Input({"type": "ruler-y", "index": _ci}, "value"),
+        Input({"type": "ruler-time", "index": _ci}, "value"),
         State({"type": "start-time", "index": _ci}, "data"),
         State("session-id", "data"),
         prevent_initial_call=True,
@@ -1403,7 +1449,7 @@ for _ci in range(1, MAX_CHARTS + 1):
         lock_flags = [("lock" in (v or [])) for v in lock_checklists]
         filter_windows = list(args[NUM_SERIES * 3:NUM_SERIES * 4])
         rest = args[NUM_SERIES * 4:]
-        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, cursor_ts_val, ruler_y_val, start_time_iso, session_id = rest
+        goto_date, goto_time, win_min, win_hr, step, n_left, n_right, nn_data, cursor_ts_val, ruler_y_val, ruler_time_str, start_time_iso, session_id = rest
 
         if not session_id:
             return _build_figure(None, [], {}), no_update, no_update, no_update
@@ -1466,13 +1512,23 @@ for _ci in range(1, MAX_CHARTS + 1):
                     .mean()
                 )
 
+        # Compute full vertical ruler timestamp from typed time + window date
+        ruler_time_full = None
+        if ruler_time_str:
+            try:
+                date_part = start_time.strftime("%Y-%m-%d")
+                ruler_time_full = f"{date_part} {ruler_time_str}"
+            except Exception:
+                pass
+
         fig = _build_figure(df_slice, tags, tag_map,
                             x_revision=start_time.isoformat(),
                             nicknames=nn_data or {},
                             own_scale_flags=own_flags,
                             lock_scale_flags=lock_flags,
                             cursor_ts=cursor_ts_val,
-                            ruler_y=ruler_y_val)
+                            ruler_y=ruler_y_val,
+                            ruler_time=ruler_time_full)
         return fig, start_time.isoformat(), start_time.strftime("%Y-%m-%d"), start_time.strftime("%H:%M")
 
     update_chart.__name__ = f"update_chart_{_ci}"
