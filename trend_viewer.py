@@ -635,6 +635,31 @@ app.layout = html.Div(style={
         ],
     ),
 
+    # Right-click context menu (hidden by default, positioned by JS)
+    html.Div(
+        id="chart-context-menu",
+        style={"display": "none", "position": "fixed", "zIndex": 10000},
+        children=[
+            html.Div(className="ctx-item", id="ctx-hover-toggle",
+                     children="\u2714  Context data on hover"),
+            html.Div(className="ctx-separator"),
+            html.Div(className="ctx-item", id="ctx-vertical-ruler",
+                     children="\u2502  Vertical Ruler"),
+            html.Div(className="ctx-item", id="ctx-horizontal-ruler",
+                     children="\u2500  Horizontal Ruler"),
+            html.Div(className="ctx-separator"),
+            html.Div(className="ctx-item", id="ctx-lock-all-scales",
+                     children="\U0001F512  Lock All Scales"),
+            html.Div(className="ctx-item", id="ctx-autoscale",
+                     children="\U0001F4CF  Autoscale Y"),
+            html.Div(className="ctx-separator"),
+            html.Div(className="ctx-item", id="ctx-copy-csv",
+                     children="\U0001F4CB  Copy CSV"),
+            html.Div(className="ctx-item", id="ctx-reset-zoom",
+                     children="\U0001F50D  Reset Zoom"),
+        ],
+    ),
+
     # Header toolbar
     html.Div(style={
         "display": "flex", "alignItems": "center", "gap": "16px",
@@ -858,6 +883,36 @@ app.index_string = '''<!DOCTYPE html>
             opacity: 0.4 !important;
             cursor: not-allowed !important;
         }
+        /* Context menu styling */
+        #chart-context-menu {
+            background-color: #1c2129;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 4px 0;
+            min-width: 200px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5), 0 0 0 1px rgba(48,54,61,0.5);
+            font-family: 'Segoe UI', Consolas, monospace;
+            font-size: 12px;
+            user-select: none;
+        }
+        .ctx-item {
+            color: #c9d1d9;
+            padding: 6px 16px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .ctx-item:hover {
+            background-color: #1f6feb;
+            color: #ffffff;
+        }
+        .ctx-item.checked::before {
+            content: '';
+        }
+        .ctx-separator {
+            height: 1px;
+            background-color: #30363d;
+            margin: 4px 0;
+        }
         /* Own-scale checkbox styling */
         .own-scale-check label {
             color: ''' + MUTED_TEXT + ''' !important;
@@ -878,6 +933,101 @@ app.index_string = '''<!DOCTYPE html>
         {%scripts%}
         {%renderer%}
     </footer>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        var menu = null;
+        var targetChartId = null;
+
+        function getMenu() {
+            if (!menu) menu = document.getElementById('chart-context-menu');
+            return menu;
+        }
+
+        /* Find which chart panel a click originated from */
+        function findChartIndex(el) {
+            while (el) {
+                if (el.classList && el.classList.contains('js-plotly-plot')) {
+                    var wrapper = el.closest('[id]');
+                    if (wrapper && wrapper.id) {
+                        try {
+                            var parsed = JSON.parse(wrapper.id.replace(/'/g, '"'));
+                            if (parsed.type === 'graph') return parsed.index;
+                        } catch(e) {}
+                    }
+                    /* Fallback: walk up to find the chart panel */
+                    var panel = el.closest('[class]');
+                    return null;
+                }
+                el = el.parentElement;
+            }
+            return null;
+        }
+
+        /* Right-click on any plotly graph area */
+        document.addEventListener('contextmenu', function(e) {
+            var plotArea = e.target.closest('.js-plotly-plot');
+            if (!plotArea) return;  /* not on a chart */
+
+            e.preventDefault();
+            var m = getMenu();
+            if (!m) return;
+
+            /* Position at mouse, clamped to viewport */
+            var x = e.clientX, y = e.clientY;
+            m.style.display = 'block';
+            var mw = m.offsetWidth, mh = m.offsetHeight;
+            var vw = window.innerWidth, vh = window.innerHeight;
+            if (x + mw > vw) x = vw - mw - 4;
+            if (y + mh > vh) y = vh - mh - 4;
+            m.style.left = x + 'px';
+            m.style.top = y + 'px';
+
+            /* Remember which chart */
+            targetChartId = findChartIndex(e.target);
+        });
+
+        /* Close menu on any outside click or Escape */
+        document.addEventListener('mousedown', function(e) {
+            var m = getMenu();
+            if (m && m.style.display !== 'none' && !m.contains(e.target)) {
+                m.style.display = 'none';
+            }
+        });
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                var m = getMenu();
+                if (m) m.style.display = 'none';
+            }
+        });
+
+        /* Handle menu item clicks */
+        document.addEventListener('click', function(e) {
+            var item = e.target.closest('.ctx-item');
+            if (!item) return;
+            var m = getMenu();
+
+            var id = item.id;
+            if (id === 'ctx-hover-toggle') {
+                /* Toggle hovermode on the target chart */
+                var graphs = document.querySelectorAll('.js-plotly-plot');
+                graphs.forEach(function(g) {
+                    if (g._fullLayout) {
+                        var current = g._fullLayout.hovermode;
+                        var next = (current === 'x unified') ? false : 'x unified';
+                        Plotly.relayout(g, {'hovermode': next});
+                        /* Update menu label */
+                        item.textContent = next
+                            ? '\u2714  Context data on hover'
+                            : '\u2610  Context data on hover';
+                    }
+                });
+            }
+            /* Placeholder actions — future implementation */
+
+            if (m) m.style.display = 'none';
+        });
+    });
+    </script>
 </body>
 </html>'''
 
