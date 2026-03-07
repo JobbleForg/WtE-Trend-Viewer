@@ -1,0 +1,1 @@
+# Constants: NUM_SERIES, MAX_CHARTS, INITIAL_VISIBLE, paths
